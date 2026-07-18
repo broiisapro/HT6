@@ -8,6 +8,8 @@
   "scripts": {
     "start": "node src/index.js",
     "generate-bed": "node scripts/generate-bed.js",
+    "prepare-stems": "node scripts/prepare-stems.js",
+    "generate-stems": "node scripts/generate-stems.js",
     "test": "node --test test/mapper.test.js"
   },
   "dependencies": {
