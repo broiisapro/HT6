@@ -16,8 +16,13 @@ async function main() {
     return;
   }
 
-  startServer();
-  await startPlayback();
+  // Epic 3: start playback first so we have sourceNode to pass to the server.
+  // (Order changed from Epic 2: server was first, but the server now needs the
+  // sourceNode returned by startPlayback() to drive playbackRate on biometric
+  // messages. Playback is fast — decoding ~60 s of WAV typically takes <50 ms
+  // — so this doesn't meaningfully delay the server becoming available.)
+  const { sourceNode } = await startPlayback();
+  startServer({ sourceNode });
 }
 
 main().catch((err) => {
