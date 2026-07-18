@@ -1,13 +1,6 @@
 /**
  * pencil-mapper.js — Epic 6: Pencil-to-Melody Mapping
  *
- * Ported unchanged from main's Epic 6 implementation — this mapping is
- * bed-agnostic (pure function of pencil input, doesn't know or care what's
- * playing underneath), so it applies to the mood-zone architecture without
- * modification. The persistent filterNode/pannerNode/lfo chain it targets
- * now lives in this branch's playback.js and survives zone switches (see
- * that file's docstring).
- *
  * Converts an incoming `type: "pencil"` contract message (pressure, x, y,
  * velocity, tilt) into melody/timbre parameters for the audio graph built in
  * `playback.js`: lowpass filter cutoff, tremolo (note-density proxy) rate,
@@ -76,6 +69,43 @@
  * biometric's ~1 msg/s), so a multi-second gap reliably means the performer
  * lifted the Pencil, not just one dropped frame.
  */
+
+// ── Item 5: Pencil melody pitch quantization ──────────────────────────────────
+
+/**
+ * A-minor pentatonic pitches: A3 C4 D4 E4 G4 A4 (low → high).
+ * Canvas y is inverted: y=0 = top of screen = highest note.
+ */
+export const PENTATONIC_FREQS = [220.00, 261.63, 293.66, 329.63, 392.00, 440.00];
+
+/**
+ * Maximum y coordinate (CSS px) for pitch quantization.
+ * Hardcoded to 10th-gen iPad landscape CSS viewport height.
+ */
+export const PITCH_Y_MAX = 820;
+
+/**
+ * Map canvas y position to the nearest A-minor pentatonic frequency.
+ *
+ * y=0 (top of canvas) → highest note (440 Hz).
+ * y=PITCH_Y_MAX (bottom) → lowest note (220 Hz).
+ *
+ * Returns both the frequency and the bucket index so callers can detect
+ * retrigger-on-bucket-change without computing the index separately.
+ *
+ * @param {number} y        - Canvas y in CSS px.
+ * @param {number} [yMax=PITCH_Y_MAX]
+ * @returns {{ freqHz: number, index: number }}
+ */
+export function quantizePitch(y, yMax = PITCH_Y_MAX) {
+  const n = PENTATONIC_FREQS.length;                    // 6 notes
+  const clamped = Math.max(0, Math.min(yMax, y));       // guard edges
+  // Invert: y=0 → t=1 (highest note), y=yMax → t=0 (lowest note).
+  const t = 1 - clamped / yMax;
+  // Map t uniformly to one of n buckets.
+  const index = Math.min(n - 1, Math.floor(t * n));
+  return { freqHz: PENTATONIC_FREQS[index], index };
+}
 
 /** Tilt (degrees from vertical) treated as "fully bright". Real range is 0–90. */
 export const TILT_MAX_DEG = 90;

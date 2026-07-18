@@ -7,8 +7,8 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "fetch-beds": "node scripts/fetch-beds.js",
-    "build:ui": "npm --prefix ../ui install && npm --prefix ../ui run build"
+    "generate-bed": "node scripts/generate-bed.js",
+    "test": "node --test test/mapper.test.js"
   },
   "dependencies": {
     "node-web-audio-api": "^1.0.9",
