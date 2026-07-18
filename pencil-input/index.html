@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Epic 4 — Pencil Capture (local)</title>
+<title>Human MIDI — Pencil Input</title>
 <style>
   :root { color-scheme: dark; }
   * { margin: 0; box-sizing: border-box; -webkit-user-select: none; user-select: none; }
@@ -39,6 +39,16 @@
     <div class="row"><span>Touch.altitudeAngle</span><span id="p-talt">?</span></div>
     <div class="row"><span>Touch.azimuthAngle</span><span id="p-tilt">?</span></div>
     <div class="row" style="display:none"><span id="p-alt"></span></div>
+    <hr style="border-color:#333;margin:12px 0">
+    <div style="font-size:12px;margin-bottom:6px;color:#aaa;font-weight:600">WebSocket</div>
+    <input id="ws-url" type="text" placeholder="ws://192.168.x.x:8765"
+      style="width:100%;padding:4px 6px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;font-size:12px;margin-bottom:6px;outline:none">
+    <div style="display:flex;gap:6px;margin-bottom:6px">
+      <button id="ws-connect-btn" style="flex:1;margin:0">Connect</button>
+      <button id="ws-disconnect-btn" style="flex:1;margin:0">Disconnect</button>
+    </div>
+    <div class="row"><span>ws status</span><span id="ws-status" style="color:#aaa">idle</span></div>
+    <div class="row"><span>msgs sent</span><span id="ws-sent">0</span></div>
     <button id="clear">Clear canvas</button>
   </div>
 </div>
@@ -90,6 +100,16 @@ function emit(s) {   // s = { x, y, t, pressure, type, tiltDeg|null }
   $("v-y").textContent = s.y.toFixed(1);
   $("v-vel").textContent = velEMA.toFixed(0);
   $("v-tilt").textContent = s.tiltDeg == null ? "null" : s.tiltDeg.toFixed(1);
+  // Epic 5: forward to audio-engine — 30/s gate is inside wsSendPencil.
+  wsSendPencil({
+    type: "pencil",
+    pressure: s.pressure,
+    x: +s.x.toFixed(1),
+    y: +s.y.toFixed(1),
+    velocity: +vel.toFixed(1),
+    tilt: s.tiltDeg != null ? +s.tiltDeg.toFixed(2) : null,
+    timestamp: Date.now()
+  });
 }
 
 // --- PRIMARY (iPad): Touch events. Touch.force is the reliable Pencil pressure;
@@ -130,6 +150,70 @@ canvas.addEventListener("pointerup", stopM);
 canvas.addEventListener("pointerleave", stopM);
 
 $("clear").onclick = () => ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+// ============================================================
+// Epic 5 — WebSocket client (pencil → audio-engine @ :8765)
+// ============================================================
+let ws = null;
+let wsOpen = false;
+let wsLastSendT = 0;
+let wsSentCount = 0;
+const WS_INTERVAL_MS = 1000 / 30;   // cap at 30 msg/s
+
+function wsSetStatus(text, color) {
+  const el = $("ws-status");
+  el.textContent = text;
+  el.style.color = color || "#aaa";
+}
+
+function wsConnect(url) {
+  if (!url) { wsSetStatus("no URL", "#f66"); return; }
+  // Clean up any existing socket without firing our own handlers during close.
+  if (ws) {
+    ws.onopen = ws.onerror = ws.onclose = ws.onmessage = null;
+    try { ws.close(); } catch (_) {}
+    ws = null;
+  }
+  wsOpen = false;
+  wsSetStatus("connecting…", "#aaa");
+  try {
+    ws = new WebSocket(url);
+  } catch (err) {
+    wsSetStatus("bad URL", "#f66"); ws = null; return;
+  }
+  ws.onopen  = () => { wsOpen = true;  wsSetStatus("connected", "#6f6"); };
+  ws.onerror = () => { wsSetStatus("error", "#f66"); };
+  // onclose fires after onerror; update to closed so the user sees terminal state.
+  ws.onclose = () => { wsOpen = false; wsSetStatus("closed", "#f66"); };
+}
+
+function wsDisconnect() {
+  if (ws) {
+    ws.onopen = ws.onerror = ws.onclose = null;
+    try { ws.close(); } catch (_) {}
+    ws = null;
+  }
+  wsOpen = false;
+  wsSetStatus("disconnected", "#aaa");
+}
+
+// Called from emit() — gated at 30/s. Drawing path is unaffected if WS is down.
+function wsSendPencil(msg) {
+  if (!wsOpen) return;
+  const now = performance.now();
+  if (now - wsLastSendT < WS_INTERVAL_MS) return;
+  wsLastSendT = now;
+  try {
+    ws.send(JSON.stringify(msg));
+    $("ws-sent").textContent = ++wsSentCount;
+  } catch (_) { /* socket closing — swallow */ }
+}
+
+$("ws-connect-btn").onclick    = () => wsConnect($("ws-url").value.trim());
+$("ws-disconnect-btn").onclick = wsDisconnect;
+$("ws-url").addEventListener("keydown", e => {
+  if (e.key === "Enter") wsConnect(e.target.value.trim());
+});
 
 // --- tilt/force availability probe: report what THIS device actually exposes ---
 function mark(el, present) { el.textContent = present ? "present" : "absent"; el.className = present ? "tilt-yes" : "tilt-no"; }
