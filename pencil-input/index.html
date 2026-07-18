@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Epic 4 — Pencil Capture (local)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; box-sizing: border-box; -webkit-user-select: none; user-select: none; }
+  html, body { height: 100%; background: #111; color: #eee; font: 14px/1.4 -apple-system, system-ui, sans-serif; }
+  #wrap { display: flex; height: 100%; }
+  #stage { position: relative; flex: 1; touch-action: none; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; background: #181818; }
+  #hud { width: 260px; padding: 16px; background: #1c1c1c; border-left: 1px solid #333; overflow-y: auto; }
+  #hud h1 { font-size: 15px; margin-bottom: 10px; }
+  #hud .row { display: flex; justify-content: space-between; padding: 3px 0; font-variant-numeric: tabular-nums; }
+  #hud .row span:last-child { color: #6cf; }
+  #hint { position: absolute; top: 12px; left: 12px; color: #666; pointer-events: none; }
+  .tilt-yes { color: #6f6 !important; } .tilt-no { color: #f66 !important; }
+  button { margin-top: 12px; width: 100%; padding: 8px; background: #333; color: #eee; border: 1px solid #555; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="c"></canvas>
+    <div id="hint">Draw with the Apple Pencil. Line thickness follows pressure.</div>
+  </div>
+  <div id="hud">
+    <h1>Pencil Capture</h1>
+    <div class="row"><span>pointerType</span><span id="v-type">–</span></div>
+    <div class="row"><span>pressure</span><span id="v-pressure">–</span></div>
+    <div class="row"><span>x</span><span id="v-x">–</span></div>
+    <div class="row"><span>y</span><span id="v-y">–</span></div>
+    <div class="row"><span>velocity px/s</span><span id="v-vel">–</span></div>
+    <div class="row"><span>tilt (deg)</span><span id="v-tilt">–</span></div>
+    <hr style="border-color:#333;margin:12px 0">
+    <div class="row"><span>PointerEvent.altitudeAngle</span><span id="p-alt">?</span></div>
+    <div class="row"><span>PointerEvent.tiltX/Y</span><span id="p-tilt">?</span></div>
+    <div class="row"><span>Touch.altitudeAngle</span><span id="p-talt">?</span></div>
+    <div class="row"><span>Touch.force</span><span id="p-tforce">?</span></div>
+    <button id="clear">Clear canvas</button>
+  </div>
+</div>
+<script>
+// --- pure logic: velocity from two samples (px/s). Guards divide-by-zero. ---
+function velocity(x0, y0, t0, x1, y1, t1) {
+  const dt = (t1 - t0) / 1000;          // ms -> s
+  if (dt <= 0) return 0;
+  return Math.hypot(x1 - x0, y1 - y0) / dt;
+}
+// self-check (logs to console; fails loudly if the math breaks)
+console.assert(velocity(0, 0, 0, 30, 40, 100) === 500, "velocity: 50px in 0.1s = 500px/s");
+console.assert(velocity(0, 0, 5, 9, 9, 5) === 0, "velocity: zero dt -> 0, no NaN/Infinity");
+
+const $ = id => document.getElementById(id);
+const canvas = $("c"), ctx = canvas.getContext("2d");
+function resize() {
+  const r = canvas.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  canvas.width = r.width * dpr; canvas.height = r.height * dpr;
+  ctx.scale(dpr, dpr); ctx.lineCap = "round"; ctx.lineJoin = "round";
+}
+addEventListener("resize", resize); resize();
+
+let last = null;        // {x,y,t}
+let velEMA = 0;         // smoothed velocity for a readable readout
+const RATE_MS = 1000 / 60;
+
+function draw(x, y, pressure) {
+  if (!last) return;
+  ctx.strokeStyle = `hsl(${200 + pressure * 120}, 90%, ${40 + pressure * 40}%)`;
+  ctx.lineWidth = 1 + pressure * 24;            // pressure -> thickness
+  ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(x, y); ctx.stroke();
+}
+
+function report(e) {
+  const x = e.clientX, y = e.clientY, t = e.timeStamp;
+  const pressure = e.pressure;                  // 0..1 for pen; ~0.5 for mouse-down
+  let vel = 0;
+  if (last) vel = velocity(last.x, last.y, last.t, x, y, t);
+  velEMA = velEMA * 0.8 + vel * 0.2;
+
+  draw(x, y, pressure);
+  last = { x, y, t };
+
+  $("v-type").textContent = e.pointerType;
+  $("v-pressure").textContent = pressure.toFixed(3);
+  $("v-x").textContent = x.toFixed(1);
+  $("v-y").textContent = y.toFixed(1);
+  $("v-vel").textContent = velEMA.toFixed(0);
+  const tiltDeg = ("altitudeAngle" in e && e.altitudeAngle != null)
+    ? (90 - e.altitudeAngle * 180 / Math.PI).toFixed(1)   // altitude -> tilt-from-vertical
+    : (("tiltX" in e && e.tiltX) ? e.tiltX.toFixed(1) : "null");
+  $("v-tilt").textContent = tiltDeg;
+}
+
+// --- capture: Pointer Events cover pen (iPad), touch, and mouse (desktop dev/mock) ---
+let drawing = false, lastEmit = 0;
+canvas.addEventListener("pointerdown", e => {
+  probePointer(e); drawing = true; last = { x: e.clientX, y: e.clientY, t: e.timeStamp }; report(e);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drawing) return;
+  if (e.timeStamp - lastEmit < RATE_MS) return;   // throttle to ~60Hz (Epic 5 caps at 30/s over the wire)
+  lastEmit = e.timeStamp;
+  // coalesced events keep the drawn line smooth without over-sampling the readout
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ce of evs) report(ce);
+});
+const stop = () => { drawing = false; last = null; };
+canvas.addEventListener("pointerup", stop);
+canvas.addEventListener("pointercancel", stop);
+canvas.addEventListener("pointerleave", stop);
+
+$("clear").onclick = () => ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+// --- tilt/altitude availability probe: report what THIS device actually exposes ---
+function mark(el, present) { el.textContent = present ? "present" : "absent"; el.className = present ? "tilt-yes" : "tilt-no"; }
+let pointerProbed = false;
+function probePointer(e) {
+  if (pointerProbed) return; pointerProbed = true;
+  mark($("p-alt"), "altitudeAngle" in e && e.altitudeAngle != null);
+  mark($("p-tilt"), "tiltX" in e && (e.tiltX !== 0 || e.tiltY !== 0));
+}
+// Touch events historically carried the reliable Apple Pencil tilt on iOS Safari — probe them too.
+let touchProbed = false;
+canvas.addEventListener("touchstart", e => {
+  if (touchProbed) return; touchProbed = true;
+  const t = e.touches[0]; if (!t) return;
+  mark($("p-talt"), "altitudeAngle" in t && t.altitudeAngle != null);
+  mark($("p-tforce"), "force" in t && t.force > 0);
+}, { passive: true });
+</script>
+</body>
+</html>
