@@ -1,4 +1,4 @@
-# Epic 0 — Contract & Scaffolding (do this first, do it yourself)
+# Epic 0 — Contract & Scaffolding (do this first)
 
 This one's small enough that the Orchestrator (Cris) does it directly rather than handing it to a coding agent — it's structure and a shared doc, not real implementation.
 
