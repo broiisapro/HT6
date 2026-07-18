@@ -26,21 +26,29 @@ const PORT = 8765;
  *   for the documented mapping rationale. A separate, shorter stale-data
  *   timer reverts to filter/tremolo/pan defaults if no pencil message
  *   arrives for PENCIL_STALE_TIMEOUT_MS ms.
+ * Epic 8: accepts an optional `fallbackPlayer` (FallbackPlayer from
+ *   fallback-player.js). When `fallbackPlayer.active` is true:
+ *   - incoming live WebSocket messages are logged but not applied, so the
+ *     fallback and live inputs don't fight over the same AudioParams.
+ *   - stale-timer revert callbacks are suppressed so the fallback's own
+ *     playback output is not overwritten.
  *
  * @param {object} [opts]
  * @param {AudioBufferSourceNode|null} [opts.sourceNode] - The looping bed source.
  * @param {BiquadFilterNode|null} [opts.filterNode] - Epic 6 brightness filter.
  * @param {StereoPannerNode|null} [opts.pannerNode] - Epic 6 stereo pan.
  * @param {OscillatorNode|null} [opts.lfo] - Epic 6 tremolo-rate oscillator.
- *   All four are returned by startPlayback(). Any omitted/null node means
- *   its corresponding messages are still logged but not applied (safe
- *   degraded mode) — lets the server run standalone for testing.
+ * @param {import('./fallback-player.js').FallbackPlayer|null} [opts.fallbackPlayer]
+ *   All four audio nodes are returned by startPlayback(). Any omitted/null
+ *   node means its corresponding messages are still logged but not applied
+ *   (safe degraded mode) — lets the server run standalone for testing.
  */
 export function startServer({
   sourceNode = null,
   filterNode = null,
   pannerNode = null,
   lfo = null,
+  fallbackPlayer = null,
 } = {}) {
   const wss = new WebSocketServer({ host: HOST, port: PORT });
 
@@ -53,6 +61,8 @@ export function startServer({
   function resetStaleTimer() {
     if (staleTimer) clearTimeout(staleTimer);
     staleTimer = setTimeout(() => {
+      // Epic 8: suppress revert while fallback is replaying biometric data.
+      if (fallbackPlayer?.active) return;
       if (sourceNode) {
         console.log(
           `[tempo] no biometric for ${STALE_TIMEOUT_MS}ms — reverting to default playbackRate=1.0 (96 BPM)`
@@ -71,6 +81,8 @@ export function startServer({
   function resetPencilStaleTimer() {
     if (pencilStaleTimer) clearTimeout(pencilStaleTimer);
     pencilStaleTimer = setTimeout(() => {
+      // Epic 8: suppress revert while fallback is replaying pencil data.
+      if (fallbackPlayer?.active) return;
       console.log(
         `[melody] no pencil for ${PENCIL_STALE_TIMEOUT_MS}ms — reverting to default filter/tremolo/pan`
       );
@@ -105,6 +117,13 @@ export function startServer({
         message = JSON.parse(raw.toString());
       } catch (err) {
         console.warn(`[server] received non-JSON message from ${remote}: ${raw}`);
+        return;
+      }
+
+      // Epic 8: while fallback is active, log but do not apply live messages
+      // so fallback and live inputs don't fight over the same AudioParams.
+      if (fallbackPlayer?.active) {
+        console.log(`[server] fallback active — live message dropped from ${remote}:`, message);
         return;
       }
 
