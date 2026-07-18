@@ -384,54 +384,6 @@ export function applyMoodInversion(clampedBPM) {
   return INPUT_MAX_BPM + INPUT_MIN_BPM - clampedBPM;
 }
 
-// ── Epic 8.5: Rate-of-change limiter ─────────────────────────────────────────
-// A sudden biometric spike (real fright, gasp, motion artifact) can swing
-// through Epic 1's smoothing window fast enough to cause a jarring, unmusical
-// lurch in tempo and — in Epic 9 — an immediate mood-category switch. Capping
-// the rate at which the *effective* BPM driving the music can change per second
-// converts that lurch into a graceful ramp.
-//
-// Value chosen: MAX_BPM_PER_SEC = 5.
-//   - At the ~1 msg/sec biometric cadence, this caps any single-step jump to
-//     5 BPM, translating to a ΔplaybackRate of 5/96 ≈ 0.052 per step.
-//   - The real Polar data (Epic 1 / Epic 3) showed successive smoothed values
-//     differing by ≤1.6 BPM per step in normal use — the limiter is invisible
-//     during normal operation.
-//   - A worst-case motion-artifact spike of +30 BPM in one step becomes a
-//     6-second linear ramp instead of an instant jump.
-//   - Too low (1–2 BPM/s) would make the tempo lag physiologically meaningful
-//     events. 5 BPM/s is audibly gradual without hiding real changes.
-
-/** Maximum BPM change allowed per second of wall-clock time. */
-export const MAX_BPM_PER_SEC = 5;
-
-/**
- * Create a stateful BPM rate-of-change limiter.
- *
- * @param {number} [maxBpmPerSec=MAX_BPM_PER_SEC]
- * @returns {(rawBpm: number) => number} limit — call with each incoming BPM;
- *   returns the effective BPM to use for mapping, capped at maxBpmPerSec
- *   change per second relative to the last call.
- */
-export function createBpmRateLimiter(maxBpmPerSec = MAX_BPM_PER_SEC) {
-  let lastBpm = null;   // null until first message
-  let lastTs  = null;   // Date.now() at last call
-
-  return function limit(rawBpm) {
-    const now = Date.now();
-    if (lastBpm === null) {
-      // First message — accept as-is (nothing to ramp from).
-      lastBpm = rawBpm;
-      lastTs  = now;
-      return rawBpm;
-    }
-
-    const dtSec  = Math.max(0, (now - lastTs) / 1000);
-    const maxDelta = maxBpmPerSec * dtSec;
-    const capped = Math.max(lastBpm - maxDelta, Math.min(lastBpm + maxDelta, rawBpm));
-
-    lastBpm = capped;
-    lastTs  = now;
-    return capped;
-  };
-}
+// Note: MAX_BPM_PER_SEC alias kept for backward compatibility.
+// The canonical constant is MAX_BPM_CHANGE_PER_SEC above.
+export const MAX_BPM_PER_SEC = MAX_BPM_CHANGE_PER_SEC;

@@ -7,7 +7,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "fetch-beds": "node scripts/fetch-beds.js"
+    "fetch-beds": "node scripts/fetch-beds.js",
     "generate-bed": "node scripts/generate-bed.js",
     "prepare-stems": "node scripts/prepare-stems.js",
     "generate-stems": "node scripts/generate-stems.js",
