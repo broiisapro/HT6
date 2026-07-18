@@ -7,6 +7,10 @@ import logging
 from human_midi_biometrics.pipeline import BiometricPipeline, PipelineConfig
 from human_midi_biometrics.sources.phone_camera import PhoneCameraPpgSource
 from human_midi_biometrics.sources.polar_ble import PolarBleConfig, PolarBleSource
+from human_midi_biometrics.sources.polar_phone_relay import (
+    PolarPhoneRelayConfig,
+    PolarPhoneRelaySource,
+)
 from human_midi_biometrics.sources.simulated import SimulatedBpmSource
 
 
@@ -14,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Human MIDI biometrics sender")
     parser.add_argument(
         "--source",
-        choices=["phone-camera", "polar-ble", "simulated"],
+        choices=["phone-camera", "polar-ble", "polar-phone-relay", "simulated"],
         required=True,
         help="Biometric source implementation to run.",
     )
@@ -39,6 +43,17 @@ def parse_args() -> argparse.Namespace:
         default="Polar",
         help="Substring to find matching BLE device name during scan.",
     )
+    parser.add_argument(
+        "--relay-port",
+        type=int,
+        default=8766,
+        help="Local HTTP port for Polar phone relay source.",
+    )
+    parser.add_argument(
+        "--relay-host",
+        default="0.0.0.0",
+        help="Local bind host for Polar phone relay source.",
+    )
     return parser.parse_args()
 
 
@@ -50,6 +65,13 @@ async def run() -> None:
         source = PhoneCameraPpgSource(camera_index=args.camera_index)
     elif args.source == "simulated":
         source = SimulatedBpmSource()
+    elif args.source == "polar-phone-relay":
+        source = PolarPhoneRelaySource(
+            config=PolarPhoneRelayConfig(
+                host=args.relay_host,
+                port=args.relay_port,
+            )
+        )
     else:
         source = PolarBleSource(config=PolarBleConfig(device_name_hint=args.device_name_hint))
 
