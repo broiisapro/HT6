@@ -202,6 +202,15 @@ None. Only `audio-engine/` was touched (`playback.js`, `server.js`,
 
 During Epic 7 integration, one seam was found in `audio-engine/src/server.js`: `createVelocitySmoother()` was called once globally and shared across all WebSocket connections, causing incorrect tremolo values when the pencil client reconnected. Fixed by moving the call inside `wss.on("connection", ...)`. See `docs/epic-7-integration.md` — "Integration seam identified and fixed" — for full details.
 
+## Epic 8.5 cross-reference
+
+Epic 8.5 adds a **static/dynamic mode** (`s` key) that freezes both biometric
+tempo and pencil melody/timbre simultaneously. When static, incoming pencil
+messages are logged but not applied to filter/tremolo/pan; the pencil stale
+timer still resets so the frozen state isn't overwritten. `pencil-mapper.js`
+is unchanged by Epic 8.5. See `docs/epic-8.5-mapping-hardening.md` — section
+2c — for full details.
+
 ## Status
 
 Tag `epic-6-complete` created on commit `862dfc4` (the Epic 6 PR merge,

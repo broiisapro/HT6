@@ -1,5 +1,11 @@
 import { WebSocketServer } from "ws";
-import { bpmToPlaybackRate, STALE_TIMEOUT_MS } from "./biometric-mapper.js";
+import {
+  clampBpm,
+  createBpmRateLimiter,
+  applyMoodInversion,
+  BED_BPM,
+  STALE_TIMEOUT_MS,
+} from "./biometric-mapper.js";
 import {
   pencilToAudioParams,
   createVelocitySmoother,
@@ -32,6 +38,16 @@ const PORT = 8765;
  *     fallback and live inputs don't fight over the same AudioParams.
  *   - stale-timer revert callbacks are suppressed so the fallback's own
  *     playback output is not overwritten.
+ * Epic 8.5: three hardening features added — all are toggled at runtime:
+ *   - Rate-of-change limiting (always on): BPM can only move MAX_BPM_CHANGE_PER_SEC
+ *     per second, converting sensor spikes into graceful ramps.
+ *   - Opposite-mood toggle (setOppositeMood): inverts BPM mapping so high HR
+ *     → calmer output and low HR → more energetic output.
+ *   - Static/dynamic mode (setStaticMode): when static, incoming biometric and
+ *     pencil messages are logged but not applied; music stays at its frozen state.
+ *
+ * Returns { wss, setOppositeMood, setStaticMode } so index.js can wire
+ * keypress handlers to the toggles.
  *
  * @param {object} [opts]
  * @param {AudioBufferSourceNode|null} [opts.sourceNode] - The looping bed source.
@@ -51,6 +67,32 @@ export function startServer({
   fallbackPlayer = null,
 } = {}) {
   const wss = new WebSocketServer({ host: HOST, port: PORT });
+
+  // ── Epic 8.5: rate limiter + mode state ─────────────────────────────────
+  // Rate limiter is always active (no on/off toggle — it's a safety net).
+  const rateLimiter = createBpmRateLimiter();
+
+  // Toggled at runtime by setOppositeMood / setStaticMode (returned below).
+  let oppositeMoodEnabled = false;
+  let staticModeEnabled = false;
+
+  function setOppositeMood(enabled) {
+    oppositeMoodEnabled = !!enabled;
+    console.log(
+      oppositeMoodEnabled
+        ? "[mood] opposite mood ON  — high HR → calmer output"
+        : "[mood] opposite mood OFF — normal mapping restored"
+    );
+  }
+
+  function setStaticMode(enabled) {
+    staticModeEnabled = !!enabled;
+    console.log(
+      staticModeEnabled
+        ? "[mode] static mode ON  — output frozen (live input ignored)"
+        : "[mode] static mode OFF — resuming live control"
+    );
+  }
 
   // ── No-data fallback timer ───────────────────────────────────────────────
   // If no biometric message arrives within STALE_TIMEOUT_MS, revert the bed
@@ -134,8 +176,24 @@ export function startServer({
           console.warn("[tempo] biometric message missing numeric bpm field — ignored");
           return;
         }
+
+        // Always reset the stale timer — the source is live even in static mode.
+        resetStaleTimer();
+
+        if (staticModeEnabled) {
+          console.log(`[tempo] static mode — ignoring heart=${message.bpm.toFixed(1)} BPM`);
+          return;
+        }
+
+        // Epic 8.5 pipeline: clamp → rate-limit → (optional invert) → ÷ BED_BPM.
+        // bpmToPlaybackRate() is the raw base mapping; the stepped form is used
+        // here so rate limiting and inversion can sit between the stages.
+        const clamped = clampBpm(message.bpm);
+        const limited = rateLimiter(clamped, rxTime);
+        const effective = oppositeMoodEnabled ? applyMoodInversion(limited) : limited;
+        const rate = effective / BED_BPM;
+
         if (sourceNode) {
-          const rate = bpmToPlaybackRate(message.bpm);
           sourceNode.playbackRate.value = rate;
           const applyTime = Date.now();
           // Log latency fields:
@@ -149,8 +207,15 @@ export function startServer({
           const transitLatency = typeof message.timestamp === "number"
             ? rxTime - message.timestamp
             : null;
+          // Include rate-limiter and mood-inversion info in the log so the
+          // operator can see the full transformation chain at a glance.
+          const rateLimitedStr = limited !== clamped
+            ? ` (rate-limited from ${clamped.toFixed(1)})`
+            : "";
+          const moodStr = oppositeMoodEnabled ? ` [mood-inverted: raw-clamped=${clamped.toFixed(1)}]` : "";
           console.log(
             `[tempo] heart=${message.bpm.toFixed(1)} BPM` +
+            ` → effective=${effective.toFixed(1)} BPM${rateLimitedStr}${moodStr}` +
             ` → playbackRate=${rate.toFixed(4)}` +
             ` | transit_latency=${transitLatency !== null ? transitLatency + "ms" : "n/a"}` +
             ` | apply_latency=${applyTime - rxTime}ms` +
@@ -159,7 +224,6 @@ export function startServer({
         } else {
           console.log(`[tempo] biometric received but no sourceNode — heart=${message.bpm} BPM (no-op)`);
         }
-        resetStaleTimer();
       }
 
       if (message.type === "pencil") {
@@ -169,6 +233,14 @@ export function startServer({
           (message.tilt !== null && typeof message.tilt !== "number")
         ) {
           console.warn("[melody] pencil message missing required numeric fields — ignored");
+          return;
+        }
+
+        // Always reset the pencil stale timer — the Pencil is still live.
+        resetPencilStaleTimer();
+
+        if (staticModeEnabled) {
+          console.log(`[melody] static mode — ignoring pencil x=${message.x} tilt=${message.tilt} vel=${message.velocity}`);
           return;
         }
 
@@ -200,7 +272,6 @@ export function startServer({
         } else {
           console.log(`[melody] pencil received but no audio nodes — (no-op)`);
         }
-        resetPencilStaleTimer();
       }
     });
 
@@ -217,5 +288,5 @@ export function startServer({
     console.error("[server] server error:", err.message);
   });
 
-  return wss;
+  return { wss, setOppositeMood, setStaticMode };
 }
