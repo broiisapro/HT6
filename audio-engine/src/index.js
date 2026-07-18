@@ -61,41 +61,13 @@ async function main() {
   // Epic 6: also pass through filterNode/pannerNode/lfo for pencil-driven
   // melody/timbre.
   const { sourceNode, filterNode, pannerNode, lfo, playBeat, applyStressIntensity, playPluck, switchBed } = await startPlayback();
-  const playable = await listPlayableZones();
-  if (playable.length === 0) {
-    console.error(`[index] every zone folder is empty under ${ASSETS_DIR}. Add tracks to at least one zone.`);
-    process.exitCode = 1;
-    return;
-  }
-  const empty = zones.filter((zone) => !playable.includes(zone));
-  if (empty.length > 0) {
-    console.warn(`[index] zone(s) with no tracks yet (not selectable until filled): ${empty.join(", ")}`);
-  }
-
-  // Playback starts first so its handle (switchBed/setTempo/setMelodyParams)
-  // is ready before the server can receive its first biometric/pencil message.
-  // Items 3, 4, 5: playback also exposes playBeat, applyStressIntensity, playPluck,
-  // and the effects-chain nodes (filterNode, pannerNode, lfo) for FallbackPlayer.
-  const playback = await startPlayback();
-  const { playBeat, applyStressIntensity, playPluck, filterNode, pannerNode, lfo } = playback;
 
   // Epic 8: fallback player replays pre-recorded sequences when live input
   // fails. Toggled by pressing f in this terminal.
-  // FallbackPlayer uses setPlaybackRate callback (= playback.setTempo) and
-  // direct node refs for melody/timbre control.
-  const fallbackPlayer = new FallbackPlayer({
-    setPlaybackRate: (rate) => playback.setTempo(rate),
-    filterNode,
-    pannerNode,
-    lfo,
-  });
+  const fallbackPlayer = new FallbackPlayer({ sourceNode, filterNode, pannerNode, lfo });
 
   const { setOppositeMood, setStaticMode } = startServer({
-    playback,
-    fallbackPlayer,
-    playBeat,
-    applyStressIntensity,
-    playPluck,
+    sourceNode, filterNode, pannerNode, lfo, fallbackPlayer, playBeat, applyStressIntensity, playPluck, switchBed,
   });
 
   // Track toggle states locally so the keypress handler can flip them.

@@ -6,12 +6,16 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
+    "start": "concurrently --kill-others --names audio,ui \"node src/index.js\" \"cd ../ui && npm run dev\"",
+    "start:audio": "node src/index.js",
     "fetch-beds": "node scripts/fetch-beds.js",
     "generate-bed": "node scripts/generate-bed.js",
     "prepare-stems": "node scripts/prepare-stems.js",
     "generate-stems": "node scripts/generate-stems.js",
     "test": "node --test test/mapper.test.js"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.3"
   },
   "dependencies": {
     "node-web-audio-api": "^1.0.9",
