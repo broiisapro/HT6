@@ -1,0 +1,12 @@
+{
+  "name": "pencil-input-test-server",
+  "version": "1.0.0",
+  "description": "Logging WebSocket server for Epic 5 verification — not deployed, dev tool only",
+  "main": "test-server.js",
+  "scripts": {
+    "test-server": "node test-server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
