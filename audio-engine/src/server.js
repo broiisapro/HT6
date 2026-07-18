@@ -74,16 +74,21 @@ export function startServer({ sourceNode = null } = {}) {
           const rate = bpmToPlaybackRate(message.bpm);
           sourceNode.playbackRate.value = rate;
           const applyTime = Date.now();
-          // Log latency: time from message receipt to playbackRate assignment.
-          // rxTime is set immediately on message arrival (before JSON.parse);
-          // applyTime is set right after the assignment — the diff measures
-          // parse + mapping overhead only (sub-ms in practice). End-to-end
-          // latency from the biometrics process to audible change is dominated
-          // by the ~1 s emit cadence + WebSocket round-trip, measured separately
-          // via manual observation (see Epic 3 session summary).
+          // Log latency fields:
+          //   transit_latency = rxTime - message.timestamp
+          //     The round-trip from the biometrics pipeline's Date.now() at
+          //     emit time to the server's Date.now() at message receipt.
+          //     Both processes are on the same Mac; this measures WebSocket
+          //     framing + loopback TCP + Node event-loop scheduling overhead.
+          //   apply_latency = applyTime - rxTime
+          //     Internal parse + mapping time only (sub-ms in practice).
+          const transitLatency = typeof message.timestamp === "number"
+            ? rxTime - message.timestamp
+            : null;
           console.log(
             `[tempo] heart=${message.bpm.toFixed(1)} BPM` +
             ` → playbackRate=${rate.toFixed(4)}` +
+            ` | transit_latency=${transitLatency !== null ? transitLatency + "ms" : "n/a"}` +
             ` | apply_latency=${applyTime - rxTime}ms` +
             ` | msg_ts=${message.timestamp}`
           );
