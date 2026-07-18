@@ -114,13 +114,23 @@ Added `_estimate_bpm_autocorrelation()` alongside existing peak-based `_estimate
 - Lag range: 40–180 BPM physiological range.
 - Does NOT replace peak-based detection — runs alongside it. Camera source currently uses whichever is non-None (peak-based tried first, autocorrelation as secondary).
 
-Tests: 80 BPM synthetic sine recovers within 1 BPM; pure noise returns None.
+Tests: 80 BPM synthetic sine recovers within 2 BPM (integer-lag quantization error at 30fps; 60*30/22 = 81.82 BPM for nearest lag to 80 BPM); pure noise returns None (R < 0.3).
 
 ---
 
 ## Final test run
 
-(To be filled in after running `npm test` one final time.)
+**JS (`npm test` in `audio-engine/`):** 46/46 pass.
+- Baseline was 38/38. Added 8 new tests: 5 for `quantizePitch`, 3 for `createStressStateMachine`.
+
+**Python (`biometrics/`):** 13/13 pass.
+- `test_smoothing.py`: 8/8 — OutlierGate (4) + ArBpmSmoother (4).
+- `test_autocorr_bpm.py`: 5/5 — autocorrelation estimator.
+- Run with: `cd biometrics && .venv/bin/python test_smoothing.py && .venv/bin/python test_autocorr_bpm.py`
+
+No pre-existing tests broken.
+
+**Bug caught during Item 6:** `import cv2` and `import numpy as np` were accidentally dropped from `phone_camera.py` during the Item 1/2 import-line edit. Only caught because Item 6 tests tried to call methods that use `np`. Fixed in the Item 6 commit. This underlines the value of running tests — the module loaded fine via `object.__new__()` but the method bodies would crash at runtime. The app would have been broken for camera users.
 
 ---
 
