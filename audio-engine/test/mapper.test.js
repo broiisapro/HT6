@@ -27,7 +27,10 @@ import {
 
 import {
   pencilToAudioParams,
+  quantizePitch,
   createVelocitySmoother,
+  PENTATONIC_FREQS,
+  PITCH_Y_MAX,
   MIN_CUTOFF_HZ,
   MAX_CUTOFF_HZ,
   DEFAULT_CUTOFF_HZ,
@@ -312,6 +315,60 @@ test("pencilToAudioParams: x out of bounds clamps to [-1, 1]", () => {
   const { pan: right } = pencilToAudioParams({ x: 99999, velocity: 500, tilt: 45 });
   assert.ok(Math.abs(left - (-1)) < 0.001, `got ${left}`);
   assert.ok(Math.abs(right - 1) < 0.001, `got ${right}`);
+});
+
+// ── quantizePitch ─────────────────────────────────────────────────────────────────
+
+test("quantizePitch: y=0 (top) → highest note (A4 = 440 Hz)", () => {
+  const { freqHz, index } = quantizePitch(0);
+  const n = PENTATONIC_FREQS.length;
+  assert.ok(Math.abs(freqHz - PENTATONIC_FREQS[n - 1]) < 0.01,
+    `y=0 should be highest note ${PENTATONIC_FREQS[n-1]}Hz, got ${freqHz}`);
+  assert.strictEqual(index, n - 1);
+});
+
+test("quantizePitch: y=PITCH_Y_MAX (bottom) → lowest note (A3 = 220 Hz)", () => {
+  const { freqHz, index } = quantizePitch(PITCH_Y_MAX);
+  assert.ok(Math.abs(freqHz - PENTATONIC_FREQS[0]) < 0.01,
+    `y=PITCH_Y_MAX should be lowest note ${PENTATONIC_FREQS[0]}Hz, got ${freqHz}`);
+  assert.strictEqual(index, 0);
+});
+
+test("quantizePitch: result freq is always a member of PENTATONIC_FREQS", () => {
+  // Sample 20 y values across the full range.
+  for (let i = 0; i <= 20; i++) {
+    const y = (i / 20) * PITCH_Y_MAX;
+    const { freqHz } = quantizePitch(y);
+    assert.ok(
+      PENTATONIC_FREQS.some(f => Math.abs(f - freqHz) < 0.01),
+      `quantizePitch(${y}) = ${freqHz} is not in PENTATONIC_FREQS`
+    );
+  }
+});
+
+test("quantizePitch: out-of-bounds y clamps (no crash, valid result)", () => {
+  const { freqHz: low } = quantizePitch(-100);
+  const { freqHz: high } = quantizePitch(PITCH_Y_MAX + 100);
+  assert.ok(PENTATONIC_FREQS.some(f => Math.abs(f - low) < 0.01),
+    `y=-100 should clamp to valid note, got ${low}`);
+  assert.ok(PENTATONIC_FREQS.some(f => Math.abs(f - high) < 0.01),
+    `y=PITCH_Y_MAX+100 should clamp to valid note, got ${high}`);
+});
+
+test("quantizePitch: each bucket edge maps to the expected note", () => {
+  // Bucket i spans t in [i/n, (i+1)/n), where t=1-y/yMax.
+  // At the exact upper edge of t for bucket i, we should get PENTATONIC_FREQS[i].
+  const n = PENTATONIC_FREQS.length;
+  for (let i = 0; i < n; i++) {
+    // t value at the centre of bucket i
+    const t = (i + 0.5) / n;
+    const y = (1 - t) * PITCH_Y_MAX;
+    const { freqHz, index } = quantizePitch(y);
+    assert.strictEqual(index, i,
+      `Bucket centre t=${t.toFixed(3)} y=${y.toFixed(1)}: expected index=${i}, got ${index}`);
+    assert.ok(Math.abs(freqHz - PENTATONIC_FREQS[i]) < 0.01,
+      `Bucket ${i}: expected ${PENTATONIC_FREQS[i]}Hz, got ${freqHz}Hz`);
+  }
 });
 
 // ── createStressStateMachine ──────────────────────────────────────────────────────

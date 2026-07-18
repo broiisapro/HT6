@@ -9,6 +9,11 @@ const THUMP_FREQ_HZ     = 60;   // fundamental: low sine rumble
 const THUMP_ATTACK_S    = 0.002; // 2ms attack
 const THUMP_DECAY_S     = 0.2;   // 200ms exponential decay
 
+/** Pluck synth constants (Item 5 — pencil melody voice). */
+const PLUCK_ATTACK_S   = 0.005;  // 5ms attack
+const PLUCK_DECAY_S    = 0.6;    // 600ms exponential decay (mid of 400–800ms)
+const PLUCK_GAIN       = 0.4;    // peak gain
+
 /** Stress layer constants (Item 4 — stress-spike triggered chain). */
 const STRESS_BP_LOW_HZ  = 200;   // bandpass centre at intensity=0
 const STRESS_BP_HIGH_HZ = 4000;  // bandpass centre at intensity=1
@@ -165,5 +170,53 @@ export async function startPlayback() {
     osc.stop(now + THUMP_ATTACK_S + THUMP_DECAY_S * 4);
   }
 
-  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity };
+  // ── Item 5: monophonic pluck voice state ─────────────────────────────────
+  // Single active oscillator+gain pair; replaced on each retrigger.
+  let _pluckOsc  = null;
+  let _pluckGain = null;
+
+  /**
+   * Trigger (or retrigger) the monophonic pluck voice at `freqHz`.
+   * Silences the previous note's oscillator immediately — the natural
+   * PLUCK_DECAY_S decay still plays through on the gain envelope, but we
+   * don’t let the oscillator keep running at the old frequency.
+   * @param {number} freqHz - Note frequency (Hz).
+   */
+  function playPluck(freqHz) {
+    const now = context.currentTime;
+
+    // Stop previous oscillator cleanly (doesn't cut the envelope — gain
+    // handles the fade; stopping the osc removes the old pitch immediately).
+    if (_pluckOsc) {
+      try { _pluckOsc.stop(now); } catch (_) {}
+      _pluckOsc = null;
+    }
+    if (_pluckGain) {
+      // Cancel scheduled values and ramp out quickly to avoid clicks.
+      _pluckGain.gain.cancelScheduledValues(now);
+      _pluckGain.gain.setTargetAtTime(0, now, 0.01);
+    }
+
+    // Create fresh oscillator + envelope gain (single-use oscillators).
+    const osc  = context.createOscillator();
+    const gain = context.createGain();
+
+    osc.type = "triangle";
+    osc.frequency.value = freqHz;
+
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(PLUCK_GAIN, now + PLUCK_ATTACK_S);
+    gain.gain.setTargetAtTime(0.0001, now + PLUCK_ATTACK_S, PLUCK_DECAY_S / 3);
+
+    osc.connect(gain);
+    gain.connect(context.destination);
+
+    osc.start(now);
+    osc.stop(now + PLUCK_ATTACK_S + PLUCK_DECAY_S * 5);
+
+    _pluckOsc  = osc;
+    _pluckGain = gain;
+  }
+
+  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity, playPluck };
 }

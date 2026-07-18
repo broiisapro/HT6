@@ -10,6 +10,7 @@ import {
 } from "./biometric-mapper.js";
 import {
   pencilToAudioParams,
+  quantizePitch,
   createVelocitySmoother,
   DEFAULT_CUTOFF_HZ,
   DEFAULT_TREMOLO_HZ,
@@ -73,11 +74,17 @@ export function startServer({
   fallbackPlayer = null,
   playBeat = null,
   applyStressIntensity = null,
+  playPluck = null,
 } = {}) {
   const wss = new WebSocketServer({ host: HOST, port: PORT });
 
   // ── Item 3: beat debounce state ─────────────────────────────────────────
   let lastBeatRxMs = 0;
+
+  // ── Item 5: pencil melody voice state (per-server, not per-connection) ────
+  // lastPitchIndex tracks the last quantized bucket during an active stroke,
+  // so we can detect retrigger-on-bucket-change.
+  let lastPitchIndex = -1;
 
   // ── Item 4: stress-spike state machine ──────────────────────────────────
   const stressMachine = createStressStateMachine();
@@ -253,6 +260,22 @@ export function startServer({
         }
       }
 
+      if (message.type === "pencil-down") {
+        // Note-on: quantize y → pitch bucket and trigger immediately.
+        if (typeof message.x === "number" && typeof message.y === "number") {
+          const { freqHz, index } = quantizePitch(message.y);
+          lastPitchIndex = index;
+          console.log(`[melody] pencil-down y=${message.y.toFixed(1)} → ${freqHz.toFixed(2)}Hz (bucket=${index})`);
+          if (playPluck) playPluck(freqHz);
+        }
+      }
+
+      if (message.type === "pencil-up") {
+        // Note-off: let the natural decay ride out (no explicit stop).
+        lastPitchIndex = -1;
+        console.log(`[melody] pencil-up — note released (decay rides out)`);
+      }
+
       if (message.type === "beat") {
         // Debounce: ignore beats closer than BEAT_DEBOUNCE_MS to guard against
         // double-detection bugs and BLE notification flooding.
@@ -289,6 +312,17 @@ export function startServer({
           velocity,
           tilt: message.tilt,
         });
+
+        // Item 5: retrigger melody voice when the quantized pitch bucket changes.
+        // Only retrigger if a stroke is active (lastPitchIndex !== -1).
+        if (typeof message.y === "number" && lastPitchIndex !== -1 && playPluck) {
+          const { freqHz, index } = quantizePitch(message.y);
+          if (index !== lastPitchIndex) {
+            lastPitchIndex = index;
+            console.log(`[melody] pitch retrigger → bucket=${index} ${freqHz.toFixed(2)}Hz`);
+            playPluck(freqHz);
+          }
+        }
 
         if (filterNode || pannerNode || lfo) {
           // setTargetAtTime (not a direct .value assignment) avoids audible

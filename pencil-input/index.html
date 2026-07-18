@@ -123,14 +123,20 @@ function touchSample(t, ts) {
 }
 let lastEmitT = 0;
 canvas.addEventListener("touchstart", e => {
-  e.preventDefault(); probeTouch(e.touches[0]); last = null; emit(touchSample(e.touches[0], e.timeStamp));
+  e.preventDefault(); probeTouch(e.touches[0]); last = null;
+  const s = touchSample(e.touches[0], e.timeStamp);
+  emit(s);
+  wsSendPencilDown(s.x, s.y);  // Item 5: note-on
 }, { passive: false });
 canvas.addEventListener("touchmove", e => {
   e.preventDefault();
   if (e.timeStamp - lastEmitT < RATE_MS) return;   // throttle ~60Hz (Epic 5 caps outbound at 30/s)
   lastEmitT = e.timeStamp; emit(touchSample(e.touches[0], e.timeStamp));
 }, { passive: false });
-const stopT = () => { last = null; };
+const stopT = () => {
+  if (last !== null) wsSendPencilUp();  // Item 5: note-off (only if a stroke was active)
+  last = null;
+};
 canvas.addEventListener("touchend", stopT);
 canvas.addEventListener("touchcancel", stopT);
 
@@ -138,14 +144,19 @@ canvas.addEventListener("touchcancel", stopT);
 let drawingM = false, lastEmitM = 0;
 canvas.addEventListener("pointerdown", e => {
   if (e.pointerType !== "mouse") return;   // pen/touch go through the Touch path above
-  drawingM = true; last = null; emit({ x: e.clientX, y: e.clientY, t: e.timeStamp, pressure: 0.5, type: "mouse", tiltDeg: null });
+  drawingM = true; last = null;
+  emit({ x: e.clientX, y: e.clientY, t: e.timeStamp, pressure: 0.5, type: "mouse", tiltDeg: null });
+  wsSendPencilDown(e.clientX, e.clientY);  // Item 5: note-on
 });
 canvas.addEventListener("pointermove", e => {
   if (!drawingM || e.pointerType !== "mouse") return;
   if (e.timeStamp - lastEmitM < RATE_MS) return;
   lastEmitM = e.timeStamp; emit({ x: e.clientX, y: e.clientY, t: e.timeStamp, pressure: 0.5, type: "mouse", tiltDeg: null });
 });
-const stopM = () => { drawingM = false; last = null; };
+const stopM = () => {
+  if (drawingM) wsSendPencilUp();  // Item 5: note-off
+  drawingM = false; last = null;
+};
 canvas.addEventListener("pointerup", stopM);
 canvas.addEventListener("pointerleave", stopM);
 
@@ -207,6 +218,20 @@ function wsSendPencil(msg) {
     ws.send(JSON.stringify(msg));
     $("ws-sent").textContent = ++wsSentCount;
   } catch (_) { /* socket closing — swallow */ }
+}
+
+// Item 5: fire-and-forget note-on/off messages (NOT rate-gated — timing matters).
+function wsSendPencilDown(x, y) {
+  if (!wsOpen) return;
+  try {
+    ws.send(JSON.stringify({ type: "pencil-down", x: +x.toFixed(1), y: +y.toFixed(1), timestamp: Date.now() }));
+  } catch (_) {}
+}
+function wsSendPencilUp() {
+  if (!wsOpen) return;
+  try {
+    ws.send(JSON.stringify({ type: "pencil-up", timestamp: Date.now() }));
+  } catch (_) {}
 }
 
 $("ws-connect-btn").onclick    = () => wsConnect($("ws-url").value.trim());
