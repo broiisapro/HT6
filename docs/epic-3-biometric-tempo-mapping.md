@@ -223,3 +223,16 @@ was pursued.
   The biometrics pipeline reconnects automatically (2s retry loop); the
   engine server accepts whatever connects. No issues observed in testing, but
   worth revisiting if the demo involves repeated start/stop of the pipeline.
+
+## Epic 8.5 cross-reference
+
+Epic 8.5 layers three hardening features on top of this epic's mapping code
+(all in `audio-engine/src/biometric-mapper.js` and `server.js`):
+- **Rate-of-change limiting** (always on): caps BPM movement at 10 BPM/sec so
+  sensor spikes become graceful ramps rather than audible lurches.
+- **Opposite-mood toggle** (`o` key): inverts the BPM→tempo direction so high HR
+  maps to calmer output. `bpmToPlaybackRate()` is not modified.
+- **Static/dynamic mode** (`s` key): freezes all audio parameters until released.
+
+See `docs/epic-8.5-mapping-hardening.md` for full documentation and the
+before/after jumpscare evidence.
