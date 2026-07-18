@@ -1,6 +1,13 @@
 /**
  * pencil-mapper.js — Epic 6: Pencil-to-Melody Mapping
  *
+ * Ported unchanged from main's Epic 6 implementation — this mapping is
+ * bed-agnostic (pure function of pencil input, doesn't know or care what's
+ * playing underneath), so it applies to the mood-zone architecture without
+ * modification. The persistent filterNode/pannerNode/lfo chain it targets
+ * now lives in this branch's playback.js and survives zone switches (see
+ * that file's docstring).
+ *
  * Converts an incoming `type: "pencil"` contract message (pressure, x, y,
  * velocity, tilt) into melody/timbre parameters for the audio graph built in
  * `playback.js`: lowpass filter cutoff, tremolo (note-density proxy) rate,

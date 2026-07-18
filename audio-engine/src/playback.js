@@ -1,11 +1,11 @@
 import { AudioContext } from "node-web-audio-api";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_CUTOFF_HZ, DEFAULT_TREMOLO_HZ } from "./pencil-mapper.js";
+import { DEFAULT_CUTOFF_HZ, DEFAULT_TREMOLO_HZ, DEFAULT_PAN } from "./pencil-mapper.js";
 
 /** Thump synth constants (Item 3 — beat events). */
-const THUMP_FREQ_HZ     = 60;   // fundamental: low sine rumble
+const THUMP_FREQ_HZ     = 60;    // fundamental: low sine rumble
 const THUMP_ATTACK_S    = 0.002; // 2ms attack
 const THUMP_DECAY_S     = 0.2;   // 200ms exponential decay
 
@@ -22,61 +22,86 @@ const STRESS_DUCK_TC    = 0.04;  // setTargetAtTime TC for duck (150ms dip)
 const STRESS_RECOVER_TC = 0.3;   // setTargetAtTime TC for duck recovery
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const BED_PATH = path.join(__dirname, "..", "assets", "bed.wav");
+const ASSETS_DIR = path.join(__dirname, "..", "assets");
+const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".ogg"]);
+const DEFAULT_ZONE = "calm";
 
-// Tremolo (Epic 6) is a periodic gain modulation: an LFO oscillator feeds a
-// depth-scaling gain node into the output gain's AudioParam, which Web Audio
-// sums with the param's base value. Base/depth are fixed structural
-// constants (not part of the pencil->param mapping), so they live here
-// rather than in pencil-mapper.js.
+/** Crossfade duration (seconds) when switching zones. */
+const CROSSFADE_SEC = 0.6;
+
+/** Tremolo (Epic 6) gain-modulation constants. */
 const TREMOLO_BASE_GAIN = 0.85;
 const TREMOLO_DEPTH = 0.15; // gain oscillates in [BASE-DEPTH, BASE+DEPTH] = [0.7, 1.0]
 
 /**
- * Loads the committed fal.ai bed (audio-engine/assets/bed.wav) and loops it
- * continuously through the system audio output via node-web-audio-api,
- * a native (non-browser) Web Audio API implementation for Node.
- *
- * Deviation from the original Tone.js plan: Tone.js was tried first, but its
- * internal type-checks (via the `standardized-audio-context` package) only
- * recognize that package's own AudioParam/AudioNode classes, not
- * node-web-audio-api's native ones — so `new Tone.Player(...)` throws
- * "param must be an AudioParam" even though node-web-audio-api is a
- * spec-compliant implementation. Rather than fight that interop, this uses
- * node-web-audio-api's native nodes directly — plain Web Audio API, no
- * Tone.js layer. See docs/epic-2-audio-engine-scaffold.md for details.
- *
- * Epic 3/6 hook point: node-web-audio-api's AudioContext already exposes the
- * full native node set (BiquadFilterNode, GainNode, playbackRate on the
- * source node, etc.) needed for tempo/filter/melody DSP — build on `context`
- * and `sourceNode` returned here rather than reintroducing Tone.js.
- *
- * Epic 6 addition: a melody/timbre chain sits between `sourceNode` and
- * `context.destination` — filterNode (lowpass, brightness) -> pannerNode
- * (stereo position) -> tremoloGain (note-density proxy, driven by an LFO).
- * These are separate AudioParams from Epic 3's `sourceNode.playbackRate`
- * (tempo), so the two epics' live inputs never contend for the same knob.
+ * Zones are whatever subdirectories exist under assets/ — not hardcoded.
+ * Drop more tracks into an existing zone's folder (e.g. assets/calm/) and
+ * they join that zone's random pool automatically; add a new zone folder
+ * (e.g. assets/epic/) and it becomes selectable with no code change.
  */
-export async function startPlayback() {
+export async function listZones() {
+  const entries = await readdir(ASSETS_DIR, { withFileTypes: true });
+  return entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+}
+
+export async function listTracks(zone) {
+  const zoneDir = path.join(ASSETS_DIR, zone);
+  const entries = await readdir(zoneDir, { withFileTypes: true });
+  return entries
+    .filter((e) => e.isFile() && AUDIO_EXTENSIONS.has(path.extname(e.name).toLowerCase()))
+    .map((e) => path.join(zoneDir, e.name));
+}
+
+/** Zones that currently have at least one track — the only ones startable/selectable right now. */
+export async function listPlayableZones() {
+  const zones = await listZones();
+  const results = await Promise.all(zones.map(async (zone) => ((await listTracks(zone)).length > 0 ? zone : null)));
+  return results.filter((zone) => zone !== null);
+}
+
+function pickRandom(list) {
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+/**
+ * Loads mood-zone tracks and loops a randomly-picked track from the current
+ * zone through a persistent filter -> pan -> tremolo effects chain to the
+ * system audio output, via node-web-audio-api.
+ *
+ * ── Persistent effects chain (survives zone switches) ───────────────────
+ * filterNode (lowpass, brightness) -> pannerNode (stereo position) ->
+ * tremoloGain (note-density proxy, driven by an LFO) -> destination.
+ *
+ * ── Zone switching + crossfade ──────────────────────────────────────────
+ * switchBed() ramps the new source gain 0->1 and the old one 1->0 over
+ * CROSSFADE_SEC, then stops/disconnects the old source after the fade.
+ *
+ * ── Item 3: Beat thump synth ────────────────────────────────────────────
+ * playBeat() fires a short low-sine oscillator on each detected heartbeat.
+ *
+ * ── Item 4: Stress noise layer ──────────────────────────────────────────
+ * A looping white-noise buffer runs through a bandpass filter + gain node.
+ * applyStressIntensity() sweeps the bandpass and gain per message, and
+ * optionally ducks the main bed on PEAK entry for a sidechain effect.
+ *
+ * ── Item 5: Monophonic pluck voice ──────────────────────────────────────
+ * playPluck() triggers (or retriggers) a triangle-wave oscillator with an
+ * exponential envelope, silencing the previous note cleanly on retrigger.
+ *
+ * @param {string} [initialZone] - Zone to start from (defaults to DEFAULT_ZONE
+ *   if available, otherwise the first playable zone).
+ */
+export async function startPlayback(initialZone) {
   const context = new AudioContext();
+  const decodedCache = new Map(); // filePath -> AudioBuffer, avoids re-decoding on repeat picks
 
-  const fileBuffer = await readFile(BED_PATH);
-  const arrayBuffer = fileBuffer.buffer.slice(
-    fileBuffer.byteOffset,
-    fileBuffer.byteOffset + fileBuffer.byteLength
-  );
-  const audioBuffer = await context.decodeAudioData(arrayBuffer);
-
-  const sourceNode = context.createBufferSource();
-  sourceNode.buffer = audioBuffer;
-  sourceNode.loop = true;
-
-  // Epic 6 melody/timbre chain.
+  // ── Persistent effects chain (survives zone switches) ──────────────────
   const filterNode = context.createBiquadFilter();
   filterNode.type = "lowpass";
   filterNode.frequency.value = DEFAULT_CUTOFF_HZ;
 
   const pannerNode = context.createStereoPanner();
+  pannerNode.pan.value = DEFAULT_PAN;
 
   const tremoloGain = context.createGain();
   tremoloGain.gain.value = TREMOLO_BASE_GAIN;
@@ -89,12 +114,9 @@ export async function startPlayback() {
   lfo.connect(lfoDepth);
   lfoDepth.connect(tremoloGain.gain);
 
-  sourceNode.connect(filterNode);
   filterNode.connect(pannerNode);
   pannerNode.connect(tremoloGain);
   tremoloGain.connect(context.destination);
-
-  sourceNode.start();
   lfo.start();
 
   // ── Item 4: Stress layer ──────────────────────────────────────────────────
@@ -123,7 +145,7 @@ export async function startPlayback() {
   noiseSource.start();
 
   /**
-   * Apply stress intensity to the triggered layer.
+   * Apply stress intensity to the triggered noise layer.
    * Called by server.js on every biometric message.
    * @param {number} intensity01  - 0..1, output of createStressStateMachine().update().
    * @param {boolean} isPeakEntry - true on the first call after entering PEAK state.
@@ -141,8 +163,6 @@ export async function startPlayback() {
       tremoloGain.gain.setTargetAtTime(TREMOLO_BASE_GAIN, now + 0.15, STRESS_RECOVER_TC);
     }
   }
-
-  console.log(`[playback] looping ${BED_PATH} (${audioBuffer.duration.toFixed(1)}s bed)`);
 
   /**
    * Fire one low-sine thump for a detected heartbeat.
@@ -179,7 +199,7 @@ export async function startPlayback() {
    * Trigger (or retrigger) the monophonic pluck voice at `freqHz`.
    * Silences the previous note's oscillator immediately — the natural
    * PLUCK_DECAY_S decay still plays through on the gain envelope, but we
-   * don’t let the oscillator keep running at the old frequency.
+   * don't let the oscillator keep running at the old frequency.
    * @param {number} freqHz - Note frequency (Hz).
    */
   function playPluck(freqHz) {
@@ -218,5 +238,111 @@ export async function startPlayback() {
     _pluckGain = gain;
   }
 
-  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity, playPluck };
+  // ── Zone-based bed management ─────────────────────────────────────────────
+
+  async function getDecodedBuffer(filePath) {
+    if (!decodedCache.has(filePath)) {
+      const fileBuffer = await readFile(filePath);
+      const arrayBuffer = fileBuffer.buffer.slice(
+        fileBuffer.byteOffset,
+        fileBuffer.byteOffset + fileBuffer.byteLength
+      );
+      decodedCache.set(filePath, await context.decodeAudioData(arrayBuffer));
+    }
+    return decodedCache.get(filePath);
+  }
+
+  let activeSource = null; // { sourceNode, gainNode }
+
+  async function switchBed(zone) {
+    const tracks = await listTracks(zone);
+    if (tracks.length === 0) {
+      throw new Error(`No tracks found for zone "${zone}" (assets/${zone}/)`);
+    }
+    const filePath = pickRandom(tracks);
+    const audioBuffer = await getDecodedBuffer(filePath);
+    const now = context.currentTime;
+
+    const sourceNode = context.createBufferSource();
+    sourceNode.buffer = audioBuffer;
+    sourceNode.loop = true;
+    const gainNode = context.createGain();
+    gainNode.gain.setValueAtTime(0, now);
+    gainNode.gain.linearRampToValueAtTime(1, now + CROSSFADE_SEC);
+    sourceNode.connect(gainNode);
+    gainNode.connect(filterNode);
+    sourceNode.start();
+
+    const outgoing = activeSource;
+    if (outgoing) {
+      outgoing.gainNode.gain.setValueAtTime(outgoing.gainNode.gain.value, now);
+      outgoing.gainNode.gain.linearRampToValueAtTime(0, now + CROSSFADE_SEC);
+      setTimeout(() => {
+        outgoing.sourceNode.stop();
+        outgoing.sourceNode.disconnect();
+        outgoing.gainNode.disconnect();
+      }, CROSSFADE_SEC * 1000 + 50);
+    }
+
+    activeSource = { sourceNode, gainNode };
+
+    console.log(
+      `[playback] zone "${zone}": looping ${path.basename(filePath)} (${audioBuffer.duration.toFixed(1)}s, picked from ${tracks.length} track(s))`
+    );
+  }
+
+  /** Apply a playbackRate to whichever source is currently active. */
+  function setTempo(rate) {
+    if (activeSource) activeSource.sourceNode.playbackRate.value = rate;
+  }
+
+  /**
+   * Apply pencil-derived melody/timbre params to the persistent effects
+   * chain. Uses setTargetAtTime (not a direct .value jump) to avoid audible
+   * zipper noise at pencil's ~30 msg/s rate.
+   */
+  function setMelodyParams({ cutoffHz, tremoloHz, pan }) {
+    const now = context.currentTime;
+    filterNode.frequency.setTargetAtTime(cutoffHz, now, 0.05);
+    lfo.frequency.setTargetAtTime(tremoloHz, now, 0.05);
+    pannerNode.pan.setTargetAtTime(pan, now, 0.05);
+  }
+
+  /** Revert melody/timbre params to their idle defaults (pencil stale-data fallback). */
+  function revertMelodyDefaults() {
+    const now = context.currentTime;
+    filterNode.frequency.setTargetAtTime(DEFAULT_CUTOFF_HZ, now, 0.05);
+    lfo.frequency.setTargetAtTime(DEFAULT_TREMOLO_HZ, now, 0.05);
+    pannerNode.pan.setTargetAtTime(DEFAULT_PAN, now, 0.05);
+  }
+
+  const playableZones = await listPlayableZones();
+  if (playableZones.length === 0) {
+    throw new Error("No zone has any tracks yet. Add audio files under assets/<zone>/.");
+  }
+  const startZone = initialZone ?? (playableZones.includes(DEFAULT_ZONE) ? DEFAULT_ZONE : playableZones[0]);
+  await switchBed(startZone);
+
+  return {
+    context,
+    zone: startZone,
+    // Zone-based bed management
+    switchBed,
+    setTempo,
+    setMelodyParams,
+    revertMelodyDefaults,
+    // Persistent effects chain nodes (needed by FallbackPlayer + server.js stale reverts)
+    filterNode,
+    pannerNode,
+    tremoloGain,
+    lfo,
+    // Item 3: per-heartbeat thump synth
+    playBeat,
+    // Item 4: stress noise layer
+    applyStressIntensity,
+    // Item 5: monophonic pluck voice
+    playPluck,
+  };
 }
+
+export { DEFAULT_ZONE };
