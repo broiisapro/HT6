@@ -174,10 +174,10 @@ producing a falsely elevated tremolo at reconnect start.
 When the iPad disconnected mid-session, the 2000ms pencil stale timer fired (`reverting to default
 filter/tremolo/pan`) while biometric [tempo] lines continued uninterrupted on their 1/sec cadence.
 
-**Audible confirmation status:**
-Tempo (playbackRate) changes and filter/tremolo/pan changes were driven by real inputs and the
-mapping math is confirmed correct by log evidence. Audible confirmation by the performing human
-(Moksh) is required — see "Known limitations" below.
+**Audible confirmation (Moksh, 2026-07-18):**
+- Tempo change was clearly audible as simulated BPM cycled up and down.
+- Reconnect behavior confirmed clean: mid-session HUD disconnect triggered the stale timer revert,
+  then fresh drawing resumed normally with no stale-state tremolo jump.
 
 ---
 
@@ -286,10 +286,9 @@ What still requires human-sensory confirmation (audible, cannot be logged):
 
 ## Known limitations of the integrated system
 
-- **Audible confirmation pending.** The hardware run (Epic 7b, 2026-07-18) confirmed real iPad
-  Pencil data reaching the engine and correct AudioParam mapping by log evidence. Audible
-  confirmation that the tempo and melody effects are perceptible by ear has not been provided in
-  writing — Moksh must confirm this before applying the `epic-7-hardware-verified` tag.
+- **Audible confirmation received (Moksh, 2026-07-18).** Tempo change clearly audible as BPM
+  cycled. Reconnect clean: stale timer reverted, fresh strokes resumed normally. Tag
+  `epic-7-hardware-verified` applied.
 - **Real Polar HR not used in this run.** BPM source was simulated (Polar relay attempted, iPhone
   app not posting). The Polar relay code path was confirmed connected (logged) but inactive. A
   full Polar-watch run is deferred to demo-day setup verification.
@@ -321,4 +320,4 @@ Commits made during Epic 7b (hardware verification):
 - (this doc update commit) — `docs(epic-7): replace synthetic smoke-test log with real hardware run evidence`
 
 Tag `epic-7-complete` points at `ef47d1e` (the smoother fix + docs).
-Tag `epic-7-hardware-verified` will be applied after Moksh provides audible confirmation.
+Tag `epic-7-hardware-verified` applied after audible confirmation from Moksh (2026-07-18).
