@@ -25,8 +25,10 @@ async function main() {
     console.warn(`[index] zone(s) with no tracks yet (not selectable until filled): ${empty.join(", ")}`);
   }
 
-  startServer();
-  await startPlayback();
+  // Playback starts first so its handle (switchBed/setTempo/setMelodyParams)
+  // is ready before the server can receive its first biometric/pencil message.
+  const playback = await startPlayback();
+  startServer({ playback });
 }
 
 main().catch((err) => {
