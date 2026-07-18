@@ -7,13 +7,14 @@ import logging
 from human_midi_biometrics.pipeline import BiometricPipeline, PipelineConfig
 from human_midi_biometrics.sources.phone_camera import PhoneCameraPpgSource
 from human_midi_biometrics.sources.polar_ble import PolarBleConfig, PolarBleSource
+from human_midi_biometrics.sources.simulated import SimulatedBpmSource
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Human MIDI biometrics sender")
     parser.add_argument(
         "--source",
-        choices=["phone-camera", "polar-ble"],
+        choices=["phone-camera", "polar-ble", "simulated"],
         required=True,
         help="Biometric source implementation to run.",
     )
@@ -47,6 +48,8 @@ async def run() -> None:
 
     if args.source == "phone-camera":
         source = PhoneCameraPpgSource(camera_index=args.camera_index)
+    elif args.source == "simulated":
+        source = SimulatedBpmSource()
     else:
         source = PolarBleSource(config=PolarBleConfig(device_name_hint=args.device_name_hint))
 
