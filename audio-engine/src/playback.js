@@ -4,6 +4,23 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CUTOFF_HZ, DEFAULT_TREMOLO_HZ } from "./pencil-mapper.js";
 
+/** Thump synth constants (Item 3 — beat events). */
+const THUMP_FREQ_HZ     = 60;   // fundamental: low sine rumble
+const THUMP_ATTACK_S    = 0.002; // 2ms attack
+const THUMP_DECAY_S     = 0.2;   // 200ms exponential decay
+
+/** Pluck synth constants (Item 5 — pencil melody voice). */
+const PLUCK_ATTACK_S   = 0.005;  // 5ms attack
+const PLUCK_DECAY_S    = 0.6;    // 600ms exponential decay (mid of 400–800ms)
+const PLUCK_GAIN       = 0.4;    // peak gain
+
+/** Stress layer constants (Item 4 — stress-spike triggered chain). */
+const STRESS_BP_LOW_HZ  = 200;   // bandpass centre at intensity=0
+const STRESS_BP_HIGH_HZ = 4000;  // bandpass centre at intensity=1
+const STRESS_BED_DUCK   = 0.6;   // main-bed gain dip on PEAK entry
+const STRESS_DUCK_TC    = 0.04;  // setTargetAtTime TC for duck (150ms dip)
+const STRESS_RECOVER_TC = 0.3;   // setTargetAtTime TC for duck recovery
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BED_PATH = path.join(__dirname, "..", "assets", "bed.wav");
 
@@ -80,7 +97,126 @@ export async function startPlayback() {
   sourceNode.start();
   lfo.start();
 
+  // ── Item 4: Stress layer ──────────────────────────────────────────────────
+  // White noise → bandpass filter → gain node driven by intensity01.
+  // Self-contained parallel chain, no interaction with the bed chain.
+  const NOISE_BUFFER_SIZE = context.sampleRate * 2; // 2 seconds of noise
+  const noiseBuffer = context.createBuffer(1, NOISE_BUFFER_SIZE, context.sampleRate);
+  const noiseData = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < NOISE_BUFFER_SIZE; i++) noiseData[i] = Math.random() * 2 - 1;
+
+  const noiseSource = context.createBufferSource();
+  noiseSource.buffer = noiseBuffer;
+  noiseSource.loop = true;
+
+  const stressBandpass = context.createBiquadFilter();
+  stressBandpass.type = "bandpass";
+  stressBandpass.frequency.value = STRESS_BP_LOW_HZ;
+  stressBandpass.Q.value = 1.5;
+
+  const stressGain = context.createGain();
+  stressGain.gain.value = 0; // silent until triggered
+
+  noiseSource.connect(stressBandpass);
+  stressBandpass.connect(stressGain);
+  stressGain.connect(context.destination);
+  noiseSource.start();
+
+  /**
+   * Apply stress intensity to the triggered layer.
+   * Called by server.js on every biometric message.
+   * @param {number} intensity01  - 0..1, output of createStressStateMachine().update().
+   * @param {boolean} isPeakEntry - true on the first call after entering PEAK state.
+   */
+  function applyStressIntensity(intensity01, isPeakEntry = false) {
+    const now = context.currentTime;
+    // Sweep bandpass centre: STRESS_BP_LOW at 0, STRESS_BP_HIGH at 1.
+    const bpFreq = STRESS_BP_LOW_HZ * Math.pow(STRESS_BP_HIGH_HZ / STRESS_BP_LOW_HZ, intensity01);
+    stressBandpass.frequency.setTargetAtTime(bpFreq, now, 0.05);
+    stressGain.gain.setTargetAtTime(intensity01, now, 0.05);
+
+    // Optional sidechain-style bed duck on PEAK entry.
+    if (isPeakEntry) {
+      tremoloGain.gain.setTargetAtTime(STRESS_BED_DUCK, now, STRESS_DUCK_TC);
+      tremoloGain.gain.setTargetAtTime(TREMOLO_BASE_GAIN, now + 0.15, STRESS_RECOVER_TC);
+    }
+  }
+
   console.log(`[playback] looping ${BED_PATH} (${audioBuffer.duration.toFixed(1)}s bed)`);
 
-  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo };
+  /**
+   * Fire one low-sine thump for a detected heartbeat.
+   * Web Audio oscillators are single-use — create a fresh one each call.
+   * @param {number} [peakGain=0.5] - 0..1 volume of the thump.
+   */
+  function playBeat(peakGain = 0.5) {
+    const now = context.currentTime;
+    const osc  = context.createOscillator();
+    const gain = context.createGain();
+
+    osc.type = "sine";
+    osc.frequency.value = THUMP_FREQ_HZ;
+
+    // Linear ramp up over THUMP_ATTACK_S, then exponential decay to near-zero.
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(peakGain, now + THUMP_ATTACK_S);
+    gain.gain.setTargetAtTime(0.0001, now + THUMP_ATTACK_S, THUMP_DECAY_S / 3);
+
+    osc.connect(gain);
+    gain.connect(context.destination);
+
+    osc.start(now);
+    // Auto-stop well after decay completes to free resources.
+    osc.stop(now + THUMP_ATTACK_S + THUMP_DECAY_S * 4);
+  }
+
+  // ── Item 5: monophonic pluck voice state ─────────────────────────────────
+  // Single active oscillator+gain pair; replaced on each retrigger.
+  let _pluckOsc  = null;
+  let _pluckGain = null;
+
+  /**
+   * Trigger (or retrigger) the monophonic pluck voice at `freqHz`.
+   * Silences the previous note's oscillator immediately — the natural
+   * PLUCK_DECAY_S decay still plays through on the gain envelope, but we
+   * don’t let the oscillator keep running at the old frequency.
+   * @param {number} freqHz - Note frequency (Hz).
+   */
+  function playPluck(freqHz) {
+    const now = context.currentTime;
+
+    // Stop previous oscillator cleanly (doesn't cut the envelope — gain
+    // handles the fade; stopping the osc removes the old pitch immediately).
+    if (_pluckOsc) {
+      try { _pluckOsc.stop(now); } catch (_) {}
+      _pluckOsc = null;
+    }
+    if (_pluckGain) {
+      // Cancel scheduled values and ramp out quickly to avoid clicks.
+      _pluckGain.gain.cancelScheduledValues(now);
+      _pluckGain.gain.setTargetAtTime(0, now, 0.01);
+    }
+
+    // Create fresh oscillator + envelope gain (single-use oscillators).
+    const osc  = context.createOscillator();
+    const gain = context.createGain();
+
+    osc.type = "triangle";
+    osc.frequency.value = freqHz;
+
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(PLUCK_GAIN, now + PLUCK_ATTACK_S);
+    gain.gain.setTargetAtTime(0.0001, now + PLUCK_ATTACK_S, PLUCK_DECAY_S / 3);
+
+    osc.connect(gain);
+    gain.connect(context.destination);
+
+    osc.start(now);
+    osc.stop(now + PLUCK_ATTACK_S + PLUCK_DECAY_S * 5);
+
+    _pluckOsc  = osc;
+    _pluckGain = gain;
+  }
+
+  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity, playPluck };
 }
