@@ -4,6 +4,7 @@ import { useEngineSocket } from "./hooks/useEngineSocket";
 import { ModeToggle } from "./components/ModeToggle";
 import { OptionCard } from "./components/OptionCard";
 import { StatusBar } from "./components/StatusBar";
+import { SimulateHeartAttackButton } from "./components/SimulateHeartAttackButton";
 import { ZONES, INTENTIONS, zoneMeta, NEUTRAL_WASH, NEUTRAL_ACCENT } from "./moods";
 import type { EngineMode, Intention, Zone } from "./types";
 
@@ -17,7 +18,7 @@ interface Pending {
 }
 
 export default function App() {
-  const { status, state, sendMode } = useEngineSocket();
+  const { status, state, sendMode, sendSimulateHeartAttack } = useEngineSocket();
   const [pending, setPending] = useState<Pending | null>(null);
   const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -116,6 +117,10 @@ export default function App() {
               ))}
             </div>
           )}
+        </div>
+
+        <div className="flex justify-center">
+          <SimulateHeartAttackButton onTrigger={sendSimulateHeartAttack} />
         </div>
 
         <StatusBar status={status} state={state} />
