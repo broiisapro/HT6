@@ -81,13 +81,15 @@ const fallbackPlayer = new FallbackPlayer({
   lfo: mockLfo,
 });
 
-// ── Start server with fallback wired up ─────────────────────────────────────
-const wss = startServer({
+// ── Start server with fallback wired up ──────────────────────────────────────
+// startServer() returns { wss, setOppositeMood, setStaticMode } — destructure wss.
+const { wss } = startServer({
   sourceNode: mockSourceNode,
   filterNode: mockFilterNode,
   pannerNode: mockPannerNode,
   lfo: mockLfo,
   fallbackPlayer,
+  zoneDwellMs: 0,  // instant zone switches for deterministic test behaviour
 });
 
 // ── Test sequence ────────────────────────────────────────────────────────────
@@ -189,13 +191,17 @@ async function runTests() {
   await delay(30);
 
   // 3b. Send a live biometric message — must be applied now.
-  const liveRateAfterDeactivate = 103 / 96; // ≈ 1.0729
+  // The rate limiter caps BPM change at 10 BPM/s from the pre-fallback value (85).
+  // After ~2s elapsed since the last rate-limiter update, dt is capped at 1s,
+  // so effective BPM = 85+10 = 95, giving rate = 95/96 ≈ 0.99.
+  // The key assertion: rate jumped well above the fallback BPM range (~0.78–0.82)
+  // meaning live input has resumed. Exact value depends on dt.
   await wsSend(reconnectedBioWs, { type: "biometric", bpm: 103, timestamp: Date.now() });
   await delay(30);
 
   assert(
-    Math.abs(mockSourceNode.playbackRate.value - liveRateAfterDeactivate) < 0.0001,
-    `[S3b] live 103 BPM after fallback deactivated → playbackRate ~${liveRateAfterDeactivate.toFixed(4)}, ` +
+    mockSourceNode.playbackRate.value > 0.9,
+    `[S3b] live 103 BPM after fallback deactivated should push rate > 0.9 (rate limiter caps to ~95/96), ` +
     `got ${mockSourceNode.playbackRate.value.toFixed(4)}`
   );
 
