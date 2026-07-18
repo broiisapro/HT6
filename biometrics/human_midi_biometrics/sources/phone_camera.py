@@ -6,9 +6,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Optional
 
-import cv2
-import numpy as np
-
 from human_midi_biometrics.biometric_source import BiometricSource
 from human_midi_biometrics.smoothing import ArBpmSmoother, OutlierGate
 
@@ -41,6 +38,12 @@ class PhoneCameraPpgSource(BiometricSource):
         self._outlier_gate = OutlierGate()
         self._bpm_smoother = ArBpmSmoother(window_size=6)
 
+        # Beat event queue: each entry is a beat timestamp (ms, epoch).
+        # Pipeline drains this queue via get_beat_events().
+        self._beat_queue: asyncio.Queue[int] = asyncio.Queue()
+        # Watermark: index of the last peak we emitted a beat for.
+        self._last_emitted_peak_idx: int = -1
+
     async def start(self) -> None:
         self._capture = cv2.VideoCapture(self.camera_index)
         self._capture.set(cv2.CAP_PROP_FPS, self.fps_target)
@@ -64,6 +67,10 @@ class PhoneCameraPpgSource(BiometricSource):
 
     def get_bpm(self) -> Optional[float]:
         return self._smoothed_bpm
+
+    def get_beat_events(self) -> "asyncio.Queue[int]":
+        """Return the asyncio.Queue that receives beat timestamps (epoch ms)."""
+        return self._beat_queue
 
     async def _capture_loop(self) -> None:
         assert self._capture is not None
@@ -99,6 +106,14 @@ class PhoneCameraPpgSource(BiometricSource):
             self._timestamps.popleft()
             self._red_signal.popleft()
 
+    def _emit_new_beats(self, candidate_indices: list, timestamps: "np.ndarray") -> None:
+        """Enqueue beat events for any peaks past the watermark."""
+        for idx in candidate_indices:
+            if idx > self._last_emitted_peak_idx:
+                beat_ts = int(timestamps[idx] * 1000)  # epoch ms
+                self._beat_queue.put_nowait(beat_ts)
+                self._last_emitted_peak_idx = idx
+
     def _estimate_bpm(self) -> Optional[float]:
         if len(self._red_signal) < 30:
             return None
@@ -127,6 +142,9 @@ class PhoneCameraPpgSource(BiometricSource):
                 continue
             candidate_indices.append(i)
             last_peak_time = t
+
+        # Emit beat events immediately for any new peaks past the watermark.
+        self._emit_new_beats(candidate_indices, timestamps)
 
         if len(candidate_indices) < 2:
             return None

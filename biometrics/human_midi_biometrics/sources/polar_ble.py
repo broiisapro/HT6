@@ -36,6 +36,8 @@ class PolarBleSource(BiometricSource):
         self._smoother = ArBpmSmoother(window_size=5)
         self._running = False
         self._disconnect_event = asyncio.Event()
+        # Beat event queue: each BLE HR notification fires one beat entry.
+        self._beat_queue: asyncio.Queue[int] = asyncio.Queue()
 
     async def start(self) -> None:
         self._preflight_bluetooth_permissions()
@@ -68,6 +70,10 @@ class PolarBleSource(BiometricSource):
             await self._client.disconnect()
             self._client = None
         self._disconnect_event.set()
+
+    def get_beat_events(self) -> "asyncio.Queue[int]":
+        """Return the asyncio.Queue that receives beat timestamps (epoch ms)."""
+        return self._beat_queue
 
     def get_bpm(self) -> Optional[float]:
         if self._last_rx_ts is None:
@@ -104,6 +110,10 @@ class PolarBleSource(BiometricSource):
             bpm_raw = int.from_bytes(data[1:3], byteorder="little")
         else:
             bpm_raw = data[1]
+
+        # Fire a beat event on every BLE HR notification (simplest version;
+        # true per-beat would require RR-interval parsing — nice-to-have).
+        self._beat_queue.put_nowait(int(time.time() * 1000))
 
         accepted = self._outlier_gate.filter(float(bpm_raw))
         if accepted is None:

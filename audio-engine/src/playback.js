@@ -4,6 +4,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CUTOFF_HZ, DEFAULT_TREMOLO_HZ } from "./pencil-mapper.js";
 
+/** Thump synth constants (Item 3 — beat events). */
+const THUMP_FREQ_HZ     = 60;   // fundamental: low sine rumble
+const THUMP_ATTACK_S    = 0.002; // 2ms attack
+const THUMP_DECAY_S     = 0.2;   // 200ms exponential decay
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BED_PATH = path.join(__dirname, "..", "assets", "bed.wav");
 
@@ -82,5 +87,31 @@ export async function startPlayback() {
 
   console.log(`[playback] looping ${BED_PATH} (${audioBuffer.duration.toFixed(1)}s bed)`);
 
-  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo };
+  /**
+   * Fire one low-sine thump for a detected heartbeat.
+   * Web Audio oscillators are single-use — create a fresh one each call.
+   * @param {number} [peakGain=0.5] - 0..1 volume of the thump.
+   */
+  function playBeat(peakGain = 0.5) {
+    const now = context.currentTime;
+    const osc  = context.createOscillator();
+    const gain = context.createGain();
+
+    osc.type = "sine";
+    osc.frequency.value = THUMP_FREQ_HZ;
+
+    // Linear ramp up over THUMP_ATTACK_S, then exponential decay to near-zero.
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(peakGain, now + THUMP_ATTACK_S);
+    gain.gain.setTargetAtTime(0.0001, now + THUMP_ATTACK_S, THUMP_DECAY_S / 3);
+
+    osc.connect(gain);
+    gain.connect(context.destination);
+
+    osc.start(now);
+    // Auto-stop well after decay completes to free resources.
+    osc.stop(now + THUMP_ATTACK_S + THUMP_DECAY_S * 4);
+  }
+
+  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat };
 }

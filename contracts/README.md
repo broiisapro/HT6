@@ -19,6 +19,25 @@ JSON messages — fire-and-forget, no response expected for MVP.
 { "type": "pencil", "pressure": 0.65, "x": 320.5, "y": 180.2, "velocity": 45.3, "tilt": null, "timestamp": 1737000000000 }
 ```
 
+### Additions (hackathon/feature-additions branch)
+
+```json
+// [ADDITION] Sent by biometrics/ — fire-and-forget per detected heartbeat.
+// Camera path: fires on each new PPG peak past the watermark.
+// Polar BLE path: fires once per BLE HR notification (~1 Hz; true per-beat
+//   would require RR-interval parsing, not yet implemented).
+// No bpm field — this is a timing event, not a measurement.
+{ "type": "beat", "timestamp": 1737000000000 }
+
+// [ADDITION] Sent by pencil-input/ — note-on/off for the melody voice.
+// Separate from the existing "pencil" message because its 2000ms stale-timeout
+// is far too slow for a note release.
+{ "type": "pencil-down", "x": 320.5, "y": 180.2, "timestamp": 1737000000000 }
+{ "type": "pencil-up", "timestamp": 1737000000000 }
+```
+
+Existing `biometric` and `pencil` message shapes are unchanged.
+
 - `bpm`: smoothed beats-per-minute, plausible human range 40–180.
 - `pressure`: 0.0–1.0, from the Pencil's `force` property.
 - `x`, `y`: canvas coordinates.

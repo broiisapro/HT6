@@ -59,14 +59,22 @@ const PORT = 8765;
  *   node means its corresponding messages are still logged but not applied
  *   (safe degraded mode) — lets the server run standalone for testing.
  */
+
+/** Minimum milliseconds between forwarded beat events (server-side debounce). */
+const BEAT_DEBOUNCE_MS = 300;
+
 export function startServer({
   sourceNode = null,
   filterNode = null,
   pannerNode = null,
   lfo = null,
   fallbackPlayer = null,
+  playBeat = null,
 } = {}) {
   const wss = new WebSocketServer({ host: HOST, port: PORT });
+
+  // ── Item 3: beat debounce state ─────────────────────────────────────────
+  let lastBeatRxMs = 0;
 
   // ── Epic 8.5: rate limiter + mode state ─────────────────────────────────
   // Rate limiter is always active (no on/off toggle — it's a safety net).
@@ -223,6 +231,18 @@ export function startServer({
           );
         } else {
           console.log(`[tempo] biometric received but no sourceNode — heart=${message.bpm} BPM (no-op)`);
+        }
+      }
+
+      if (message.type === "beat") {
+        // Debounce: ignore beats closer than BEAT_DEBOUNCE_MS to guard against
+        // double-detection bugs and BLE notification flooding.
+        if (rxTime - lastBeatRxMs < BEAT_DEBOUNCE_MS) {
+          console.log(`[beat] debounced (${rxTime - lastBeatRxMs}ms since last beat)`);
+        } else {
+          lastBeatRxMs = rxTime;
+          console.log(`[beat] thump @ ts=${message.timestamp}`);
+          if (playBeat) playBeat();
         }
       }
 
