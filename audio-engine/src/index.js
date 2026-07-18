@@ -31,7 +31,11 @@ async function main() {
   // fails. Toggled by pressing f in this terminal.
   const fallbackPlayer = new FallbackPlayer({ sourceNode, filterNode, pannerNode, lfo });
 
-  startServer({ sourceNode, filterNode, pannerNode, lfo, fallbackPlayer });
+  const { setOppositeMood, setStaticMode } = startServer({ sourceNode, filterNode, pannerNode, lfo, fallbackPlayer });
+
+  // Track toggle states locally so the keypress handler can flip them.
+  let oppositeMoodOn = false;
+  let staticModeOn = false;
 
   // ── Keypress handler (Epic 8 fallback trigger) ────────────────────────────
   // f  → toggle fallback on/off
@@ -52,8 +56,17 @@ async function main() {
           fallbackPlayer.start();
         }
       }
+      // Epic 8.5: 'o' toggles opposite-mood mapping; 's' toggles static mode.
+      if (key.name === "o") {
+        oppositeMoodOn = !oppositeMoodOn;
+        setOppositeMood(oppositeMoodOn);
+      }
+      if (key.name === "s") {
+        staticModeOn = !staticModeOn;
+        setStaticMode(staticModeOn);
+      }
     });
-    console.log("[index] press f to toggle fallback playback. Ctrl+C to exit.");
+    console.log("[index] keys: f=fallback  o=opposite-mood  s=static/freeze  Ctrl+C=exit");
   } else {
     // Non-TTY environment (piped input, CI, tests) — keypress handler is
     // skipped; fallback can still be toggled programmatically via

@@ -1,5 +1,6 @@
 /**
  * biometric-mapper.js — Epic 3: Biometric-to-Tempo Mapping
+ *                        Epic 8.5: Mapping Hardening extensions
  *
  * Converts a heart-rate BPM value (from the Epic 1 biometrics pipeline) into a
  * Web Audio API `playbackRate` for the looping fal.ai bed in `playback.js`.
@@ -61,6 +62,22 @@
  * STALE_TIMEOUT_MS = 8000 ms (~8 missed updates at the ~1 msg/sec rate).
  * Long enough to absorb brief WebSocket reconnect gaps without false resets;
  * short enough to recover within one breath if the detector is restarted.
+ *
+ * ── Epic 8.5 extensions ──────────────────────────────────────────────────────
+ * Three hardening features are layered on top of the base mapping:
+ *
+ * 1. Rate-of-change limiting (createBpmRateLimiter): caps how fast the
+ *    effective BPM driving the music can move per second, converting sudden
+ *    sensor spikes into graceful ramps. Applied AFTER clamp, BEFORE rate calc.
+ *
+ * 2. Mood inversion (applyMoodInversion): reflects the clamped BPM about the
+ *    midpoint of [INPUT_MIN, INPUT_MAX] so that high BPM → calmer output and
+ *    low BPM → more energetic output. Applied AFTER rate limiting.
+ *
+ * 3. Static/dynamic mode: implemented in server.js — when static, incoming
+ *    messages are not applied; the music stays frozen at its current state.
+ *
+ * See docs/epic-8.5-mapping-hardening.md for full documentation.
  */
 
 /** BPM at which the fal.ai bed was generated (from the generation prompt). */
@@ -79,12 +96,128 @@ export const INPUT_MAX_BPM = 130;
 export const STALE_TIMEOUT_MS = 8000;
 
 /**
+ * Maximum BPM change allowed per second on the effective BPM driving the
+ * music. Applied on top of (not instead of) Epic 1's RollingBpmSmoother.
+ *
+ * Value: 10 BPM/sec, chosen for musical grace:
+ *   - At 96 BPM (native tempo), 10 BPM/sec ≈ 10% tempo change per second —
+ *     comparable to a moderately fast ritardando/accelerando in live music.
+ *   - A sudden physiological spike of 40 BPM (startle reflex, motion artifact)
+ *     ramps over ~4 seconds: dramatic and audible, but a smooth ramp rather
+ *     than an instant lurch.
+ *   - The full usable range (50–130 BPM = 80 BPM span) traverses in ~8 seconds
+ *     at maximum speed — graceful at demo scale.
+ *   - Below 5 BPM/sec: sluggish; loses sense of performer connection.
+ *   - Above 20 BPM/sec: insufficient protection against sensor artifacts.
+ *
+ * Jumpscare before/after (concrete simulation at 1s update interval):
+ *   Spike scenario: BPM 72 → 122 in one update.
+ *   BEFORE: playbackRate 0.750 → 1.271 (Δ=0.521 in 1 step — audible lurch).
+ *   AFTER:  effective BPM 72 → 82,  playbackRate 0.750 → 0.854 (Δ=0.104 — graceful ramp).
+ *   The spike is spread over ~5 subsequent 1-second updates instead.
+ */
+export const MAX_BPM_CHANGE_PER_SEC = 10;
+
+/**
+ * Clamp a raw heart-rate BPM to the valid input range [INPUT_MIN_BPM, INPUT_MAX_BPM].
+ *
+ * Exposed separately from bpmToPlaybackRate so that Epic 8.5's server.js can
+ * interleave rate limiting and mood inversion between the clamp and the
+ * final rate calculation without duplicating the clamp expression.
+ *
+ * @param {number} heartBPM
+ * @returns {number} Clamped BPM in [INPUT_MIN_BPM, INPUT_MAX_BPM].
+ */
+export function clampBpm(heartBPM) {
+  return Math.max(INPUT_MIN_BPM, Math.min(INPUT_MAX_BPM, heartBPM));
+}
+
+/**
  * Convert an incoming heart-rate BPM to a Web Audio `playbackRate` value.
+ *
+ * The base Epic 3 function — unchanged by Epic 8.5. When rate limiting and/or
+ * mood inversion are active, server.js calls clampBpm + createBpmRateLimiter +
+ * applyMoodInversion + (÷ BED_BPM) directly rather than going through this
+ * convenience wrapper, so this function always reflects the raw linear mapping.
  *
  * @param {number} heartBPM - Raw BPM from the biometric contract message.
  * @returns {number}        - playbackRate to set on AudioBufferSourceNode.
  */
 export function bpmToPlaybackRate(heartBPM) {
-  const clamped = Math.max(INPUT_MIN_BPM, Math.min(INPUT_MAX_BPM, heartBPM));
-  return clamped / BED_BPM;
+  return clampBpm(heartBPM) / BED_BPM;
+}
+
+/**
+ * Create a stateful rate limiter for the effective BPM value driving the music.
+ *
+ * Caps how fast the effective BPM can change per second, regardless of how
+ * large the incoming smoothed-BPM jump is. Applied AFTER Epic 1/3's clamp and
+ * smoothing, not instead of them — it is the final guard before the rate calc.
+ *
+ * Algorithm:
+ *   dt      = min((now - lastUpdateMs) / 1000, 1.0)   ← capped to avoid huge
+ *   maxDelta = maxBpmPerSec × dt                        jump after a long pause
+ *   effectiveBPM = lastBPM + clamp(targetBPM - lastBPM, -maxDelta, +maxDelta)
+ *
+ * The 1-second dt cap ensures that switching back from static mode (during
+ * which the limiter's clock is paused) does not open a window for a large
+ * single-step jump.
+ *
+ * @param {number} [maxBpmPerSec=MAX_BPM_CHANGE_PER_SEC]
+ * @returns {(targetBPM: number, nowMs?: number) => number}
+ */
+export function createBpmRateLimiter(maxBpmPerSec = MAX_BPM_CHANGE_PER_SEC) {
+  let lastEffectiveBPM = null;
+  let lastUpdateMs = null;
+
+  return function limit(targetBPM, nowMs = Date.now()) {
+    if (lastEffectiveBPM === null) {
+      // First call: no history — accept the value as-is so the limiter
+      // initialises at the real current BPM rather than ramping from zero.
+      lastEffectiveBPM = targetBPM;
+      lastUpdateMs = nowMs;
+      return targetBPM;
+    }
+
+    // Cap dt to 1 second to prevent a large allowed jump after a long pause
+    // (e.g. resuming from static mode after 30 s).
+    const dt = Math.min((nowMs - lastUpdateMs) / 1000, 1.0);
+    const maxDelta = maxBpmPerSec * dt;
+    const delta = targetBPM - lastEffectiveBPM;
+    const effectiveBPM =
+      Math.abs(delta) <= maxDelta
+        ? targetBPM
+        : lastEffectiveBPM + Math.sign(delta) * maxDelta;
+
+    lastEffectiveBPM = effectiveBPM;
+    lastUpdateMs = nowMs;
+    return effectiveBPM;
+  };
+}
+
+/**
+ * Invert the BPM position within [INPUT_MIN_BPM, INPUT_MAX_BPM].
+ *
+ * Used for the "opposite mood" toggle: high heart rate → calmer music output,
+ * low heart rate → more energetic music output. Implemented as a reflection
+ * about the midpoint of the clamped range:
+ *
+ *   invertedBPM = INPUT_MAX_BPM + INPUT_MIN_BPM - clampedBPM
+ *
+ * Concrete values (INPUT_MIN=50, INPUT_MAX=130):
+ *   50  BPM (slow HR) → 130 BPM effective → playbackRate 1.354 (energetic output)
+ *   96  BPM (mid HR)  →  84 BPM effective → playbackRate 0.875 (calmer output)
+ *   130 BPM (fast HR) →  50 BPM effective → playbackRate 0.521 (slowest output)
+ *
+ * The output is always within [INPUT_MIN_BPM, INPUT_MAX_BPM], so no
+ * additional clamping is needed after inversion.
+ *
+ * Applied AFTER rate limiting (limiting the raw physiological signal, not the
+ * inverted one) and BEFORE the final ÷ BED_BPM calculation.
+ *
+ * @param {number} clampedBPM - Already-clamped BPM in [INPUT_MIN_BPM, INPUT_MAX_BPM].
+ * @returns {number} Inverted BPM, still in [INPUT_MIN_BPM, INPUT_MAX_BPM].
+ */
+export function applyMoodInversion(clampedBPM) {
+  return INPUT_MAX_BPM + INPUT_MIN_BPM - clampedBPM;
 }

@@ -11,9 +11,13 @@ import assert from "node:assert/strict";
 
 import {
   bpmToPlaybackRate,
+  clampBpm,
+  createBpmRateLimiter,
+  applyMoodInversion,
   BED_BPM,
   INPUT_MIN_BPM,
   INPUT_MAX_BPM,
+  MAX_BPM_CHANGE_PER_SEC,
 } from "../src/biometric-mapper.js";
 
 import {
@@ -31,6 +35,172 @@ import {
   X_MAX,
   VELOCITY_SMOOTHING_ALPHA,
 } from "../src/pencil-mapper.js";
+
+// ── clampBpm ────────────────────────────────────────────────────────────────
+
+test("clampBpm: value within range passes through unchanged", () => {
+  assert.strictEqual(clampBpm(96), 96);
+  assert.strictEqual(clampBpm(INPUT_MIN_BPM), INPUT_MIN_BPM);
+  assert.strictEqual(clampBpm(INPUT_MAX_BPM), INPUT_MAX_BPM);
+});
+
+test("clampBpm: value below INPUT_MIN_BPM clamps to INPUT_MIN_BPM", () => {
+  assert.strictEqual(clampBpm(0), INPUT_MIN_BPM);
+  assert.strictEqual(clampBpm(40), INPUT_MIN_BPM);
+});
+
+test("clampBpm: value above INPUT_MAX_BPM clamps to INPUT_MAX_BPM", () => {
+  assert.strictEqual(clampBpm(200), INPUT_MAX_BPM);
+  assert.strictEqual(clampBpm(180), INPUT_MAX_BPM);
+});
+
+// ── createBpmRateLimiter ──────────────────────────────────────────────────────
+
+test("createBpmRateLimiter: first call returns target BPM unchanged (no history)", () => {
+  const limit = createBpmRateLimiter(10);
+  const result = limit(80, 0);
+  assert.strictEqual(result, 80);
+});
+
+test("createBpmRateLimiter: delta within limit in 1s passes through unchanged", () => {
+  const limit = createBpmRateLimiter(10);
+  limit(72, 0);           // initialise at 72 BPM
+  // 1 second later, target 78 BPM — delta=6 < max 10 BPM/s
+  const result = limit(78, 1000);
+  assert.strictEqual(result, 78);
+});
+
+test("createBpmRateLimiter: delta exceeding limit in 1s is capped (jumpscare fix)", () => {
+  const limit = createBpmRateLimiter(10);
+  limit(72, 0);           // initialise at 72 BPM
+  // 1 second later, sudden spike to 122 BPM — delta=50, cap=10
+  const result = limit(122, 1000);
+  // Should only move 10 BPM → 82
+  assert.ok(Math.abs(result - 82) < 0.001, `got ${result}, expected 82`);
+});
+
+test("createBpmRateLimiter: dt is capped at 1s so max delta is 10 BPM even over 2s gap", () => {
+  // dt is capped to 1.0 s regardless of actual elapsed time. This ensures the
+  // max BPM change per update is always 10 (not 20 for a 2-s gap, 300 for 30-s).
+  const limit = createBpmRateLimiter(10);
+  limit(72, 0);           // initialise at 72 BPM
+  // 2 seconds later, spike to 122 BPM — dt capped to 1s → max delta = 10 BPM
+  const result = limit(122, 2000);
+  assert.ok(Math.abs(result - 82) < 0.001, `got ${result}, expected 82`);
+});
+
+test("createBpmRateLimiter: dt is capped at 1s even after a long pause", () => {
+  // Simulates switching back from static mode after 30 seconds.
+  // Without dt cap the limiter would allow a 300 BPM swing; with cap it
+  // allows at most 10 BPM × 1s = 10 BPM from the pre-freeze state.
+  const limit = createBpmRateLimiter(10);
+  limit(72, 0);                    // initialise at 72 BPM
+  const result = limit(130, 30000); // 30 seconds later, spike to max
+  // dt is capped to 1s → max delta = 10 → effective = 82
+  assert.ok(Math.abs(result - 82) < 0.001, `got ${result}, expected 82`);
+});
+
+test("createBpmRateLimiter: negative delta (BPM drop) is also capped", () => {
+  const limit = createBpmRateLimiter(10);
+  limit(120, 0);          // initialise at 120 BPM
+  const result = limit(60, 1000); // 1 second later, sudden drop
+  // Should only move -10 BPM → 110
+  assert.ok(Math.abs(result - 110) < 0.001, `got ${result}, expected 110`);
+});
+
+test("createBpmRateLimiter: independent instances do not share state", () => {
+  const a = createBpmRateLimiter(10);
+  const b = createBpmRateLimiter(10);
+  a(72, 0);
+  b(100, 0);
+  const ra = a(122, 1000); // capped from 72 → 82
+  const rb = b(60, 1000);  // capped from 100 → 90
+  assert.ok(Math.abs(ra - 82) < 0.001, `a got ${ra}, expected 82`);
+  assert.ok(Math.abs(rb - 90) < 0.001, `b got ${rb}, expected 90`);
+});
+
+test("createBpmRateLimiter: uses MAX_BPM_CHANGE_PER_SEC as default", () => {
+  // Confirm the exported default constant is wired correctly.
+  const limit = createBpmRateLimiter(); // default maxBpmPerSec
+  limit(72, 0);
+  const result = limit(130, 1000);
+  // Should cap at 72 + MAX_BPM_CHANGE_PER_SEC
+  assert.ok(Math.abs(result - (72 + MAX_BPM_CHANGE_PER_SEC)) < 0.001,
+    `got ${result}, expected ${72 + MAX_BPM_CHANGE_PER_SEC}`);
+});
+
+// ── jumpscare before/after simulation ────────────────────────────────────────
+// Demonstrates the key Epic 8.5 invariant with concrete before/after numbers
+// matching the documented evidence in docs/epic-8.5-mapping-hardening.md.
+
+test("jumpscare fix: BPM spike 72→122 without limiter would jump 0.521 rate in 1s", () => {
+  // BEFORE: raw mapping with no rate limiting
+  const rateBefore = 72 / BED_BPM;  // 0.750
+  const rateAfter  = 122 / BED_BPM; // 1.271
+  const delta = rateAfter - rateBefore;
+  assert.ok(Math.abs(delta - (50 / BED_BPM)) < 0.001, `delta was ${delta}`);
+  assert.ok(delta > 0.5, `delta ${delta} should be a jarring lurch (>0.5 rate change)`);
+});
+
+test("jumpscare fix: BPM spike 72→122 WITH limiter ramps to only 82 BPM (0.104 rate change)", () => {
+  // AFTER: with rate limiter at default 10 BPM/sec, 1-second update interval
+  const limit = createBpmRateLimiter(MAX_BPM_CHANGE_PER_SEC);
+  limit(72, 0);
+  const effectiveBPM = limit(122, 1000); // 1 second later
+  assert.ok(Math.abs(effectiveBPM - 82) < 0.001, `effective BPM=${effectiveBPM}, expected 82`);
+  const rateBefore = 72 / BED_BPM;  // 0.750
+  const rateAfter  = effectiveBPM / BED_BPM; // 0.854
+  const delta = rateAfter - rateBefore;
+  // 5x smaller jump than without limiter (0.104 vs 0.521)
+  assert.ok(delta < 0.5 / 4, `rate delta ${delta.toFixed(3)} should be graceful (<0.125)`);
+  assert.ok(Math.abs(delta - (10 / BED_BPM)) < 0.001, `delta=${delta.toFixed(4)}, expected ${(10 / BED_BPM).toFixed(4)}`);
+});
+
+// ── applyMoodInversion ────────────────────────────────────────────────────────
+
+test("applyMoodInversion: INPUT_MIN_BPM → INPUT_MAX_BPM (slow HR becomes energetic output)", () => {
+  const result = applyMoodInversion(INPUT_MIN_BPM);
+  assert.strictEqual(result, INPUT_MAX_BPM);
+});
+
+test("applyMoodInversion: INPUT_MAX_BPM → INPUT_MIN_BPM (fast HR becomes calm output)", () => {
+  const result = applyMoodInversion(INPUT_MAX_BPM);
+  assert.strictEqual(result, INPUT_MIN_BPM);
+});
+
+test("applyMoodInversion: midpoint maps to midpoint", () => {
+  const mid = (INPUT_MIN_BPM + INPUT_MAX_BPM) / 2; // 90
+  const result = applyMoodInversion(mid);
+  assert.strictEqual(result, mid);
+});
+
+test("applyMoodInversion: result stays within [INPUT_MIN_BPM, INPUT_MAX_BPM]", () => {
+  for (const bpm of [50, 70, 96, 110, 130]) {
+    const result = applyMoodInversion(bpm);
+    assert.ok(
+      result >= INPUT_MIN_BPM && result <= INPUT_MAX_BPM,
+      `applyMoodInversion(${bpm}) = ${result} out of range`
+    );
+  }
+});
+
+test("applyMoodInversion: double inversion is a no-op (round-trip)", () => {
+  for (const bpm of [50, 72, 96, 108, 130]) {
+    const result = applyMoodInversion(applyMoodInversion(bpm));
+    assert.ok(Math.abs(result - bpm) < 0.001, `double-invert(${bpm}) = ${result}`);
+  }
+});
+
+test("applyMoodInversion: inverted mapping is still within playbackRate [0.52, 1.36]", () => {
+  // The output of applyMoodInversion is still a valid clamped BPM,
+  // so dividing by BED_BPM gives a valid playbackRate — no clamping needed.
+  for (const bpm of [50, 96, 130]) {
+    const inverted = applyMoodInversion(bpm);
+    const rate = inverted / BED_BPM;
+    assert.ok(rate >= INPUT_MIN_BPM / BED_BPM - 0.001 && rate <= INPUT_MAX_BPM / BED_BPM + 0.001,
+      `rate ${rate} out of expected range for bpm=${bpm}`);
+  }
+});
 
 // ── bpmToPlaybackRate ────────────────────────────────────────────────────────
 
