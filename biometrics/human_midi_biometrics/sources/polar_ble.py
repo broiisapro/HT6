@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import plistlib
+import platform
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
-
-from bleak import BleakClient, BleakScanner
 
 from human_midi_biometrics.biometric_source import BiometricSource
 from human_midi_biometrics.smoothing import RollingBpmSmoother
@@ -26,7 +28,7 @@ class PolarBleConfig:
 class PolarBleSource(BiometricSource):
     def __init__(self, config: PolarBleConfig | None = None) -> None:
         self.config = config or PolarBleConfig()
-        self._client: Optional[BleakClient] = None
+        self._client: Optional[object] = None
         self._connected_device_name: Optional[str] = None
         self._latest_bpm: Optional[float] = None
         self._last_rx_ts: Optional[float] = None
@@ -35,6 +37,9 @@ class PolarBleSource(BiometricSource):
         self._disconnect_event = asyncio.Event()
 
     async def start(self) -> None:
+        self._preflight_bluetooth_permissions()
+        from bleak import BleakClient
+
         device = await self._find_device()
         if device is None:
             raise RuntimeError(
@@ -74,6 +79,8 @@ class PolarBleSource(BiometricSource):
         await self._disconnect_event.wait()
 
     async def _find_device(self):
+        from bleak import BleakScanner
+
         devices = await BleakScanner.discover(timeout=self.config.scan_timeout_seconds)
         hint = self.config.device_name_hint.lower()
         for device in devices:
@@ -102,3 +109,37 @@ class PolarBleSource(BiometricSource):
             return
         self._latest_bpm = smoothed
         self._last_rx_ts = time.time()
+
+    def _preflight_bluetooth_permissions(self) -> None:
+        if platform.system() != "Darwin":
+            return
+        app_root = self._find_python_app_root(os.path.realpath(sys.executable))
+        if not app_root:
+            candidate = os.path.join(
+                os.path.realpath(sys.base_prefix),
+                "Resources",
+                "Python.app",
+                "Contents",
+            )
+            if os.path.exists(os.path.join(candidate, "Info.plist")):
+                app_root = candidate
+        if not app_root:
+            return
+        plist_path = os.path.join(app_root, "Info.plist")
+        try:
+            with open(plist_path, "rb") as f:
+                plist = plistlib.load(f)
+        except Exception:
+            return
+        if "NSBluetoothAlwaysUsageDescription" not in plist:
+            raise RuntimeError(
+                "Bluetooth scan blocked on macOS: Python.app Info.plist is missing "
+                "NSBluetoothAlwaysUsageDescription. bleak scanning will SIGABRT under TCC."
+            )
+
+    @staticmethod
+    def _find_python_app_root(executable_path: str) -> Optional[str]:
+        marker = "/Contents/MacOS/"
+        if marker in executable_path:
+            return executable_path.split(marker)[0] + "/Contents"
+        return None
