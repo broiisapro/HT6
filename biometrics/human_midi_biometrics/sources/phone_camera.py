@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from human_midi_biometrics.biometric_source import BiometricSource
-from human_midi_biometrics.smoothing import RollingBpmSmoother
+from human_midi_biometrics.smoothing import ArBpmSmoother, OutlierGate
 
 
 @dataclass
@@ -38,7 +38,8 @@ class PhoneCameraPpgSource(BiometricSource):
         self._timestamps: Deque[float] = deque()
         self._red_signal: Deque[float] = deque()
         self._smoothed_bpm: Optional[float] = None
-        self._bpm_smoother = RollingBpmSmoother(window_size=6)
+        self._outlier_gate = OutlierGate()
+        self._bpm_smoother = ArBpmSmoother(window_size=6)
 
     async def start(self) -> None:
         self._capture = cv2.VideoCapture(self.camera_index)
@@ -84,9 +85,11 @@ class PhoneCameraPpgSource(BiometricSource):
 
             bpm = self._estimate_bpm()
             if bpm is not None:
-                smoothed = self._bpm_smoother.add(bpm)
-                if smoothed is not None:
-                    self._smoothed_bpm = smoothed
+                accepted = self._outlier_gate.filter(bpm)
+                if accepted is not None:
+                    smoothed = self._bpm_smoother.add(accepted)
+                    if smoothed is not None:
+                        self._smoothed_bpm = smoothed
 
             await asyncio.sleep(frame_delay)
 

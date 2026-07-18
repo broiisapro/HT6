@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from human_midi_biometrics.biometric_source import BiometricSource
-from human_midi_biometrics.smoothing import RollingBpmSmoother
+from human_midi_biometrics.smoothing import ArBpmSmoother, OutlierGate
 
 HEART_RATE_SERVICE_UUID = "0000180d-0000-1000-8000-00805f9b34fb"
 HEART_RATE_MEASUREMENT_CHAR_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
@@ -32,7 +32,8 @@ class PolarBleSource(BiometricSource):
         self._connected_device_name: Optional[str] = None
         self._latest_bpm: Optional[float] = None
         self._last_rx_ts: Optional[float] = None
-        self._smoother = RollingBpmSmoother(window_size=5)
+        self._outlier_gate = OutlierGate()
+        self._smoother = ArBpmSmoother(window_size=5)
         self._running = False
         self._disconnect_event = asyncio.Event()
 
@@ -104,7 +105,10 @@ class PolarBleSource(BiometricSource):
         else:
             bpm_raw = data[1]
 
-        smoothed = self._smoother.add(float(bpm_raw))
+        accepted = self._outlier_gate.filter(float(bpm_raw))
+        if accepted is None:
+            return
+        smoothed = self._smoother.add(accepted)
         if smoothed is None:
             return
         self._latest_bpm = smoothed
