@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Human MIDI — Live Tipping</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  html, body {
+    height: 100%;
+    background: radial-gradient(circle at top, #1f2330, #0f1117 45%, #090a0f);
+    color: #edf0ff;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main {
+    max-width: 780px;
+    margin: 0 auto;
+    padding: 24px 18px 40px;
+  }
+  h1 {
+    font-size: 30px;
+    margin-bottom: 6px;
+    letter-spacing: 0.2px;
+  }
+  .subtitle {
+    color: #b7bfd8;
+    margin-bottom: 16px;
+  }
+  .card {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 12px;
+  }
+  .card h2 {
+    font-size: 15px;
+    margin-bottom: 10px;
+    letter-spacing: 0.2px;
+  }
+  .row {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+  label {
+    color: #cad1e8;
+    font-size: 12px;
+    letter-spacing: 0.2px;
+  }
+  input {
+    width: 100%;
+    border-radius: 8px;
+    border: 1px solid #454d6b;
+    background: #171b2a;
+    color: #eef1ff;
+    padding: 8px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+    outline: none;
+  }
+  input:focus {
+    border-color: #7ea5ff;
+    box-shadow: 0 0 0 3px rgba(126, 165, 255, 0.15);
+  }
+  .inline {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  button {
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    background: #232a42;
+    color: #f2f5ff;
+    padding: 8px 11px;
+    cursor: pointer;
+    font-size: 12px;
+    letter-spacing: 0.2px;
+  }
+  button:hover { background: #2b3554; }
+  button.primary {
+    border-color: #57c687;
+    background: #174d2f;
+  }
+  button.primary:hover { background: #1d5d39; }
+  button.warn {
+    border-color: #f2a75f;
+    background: #5a3715;
+  }
+  button.warn:hover { background: #6a4219; }
+  #ws-status {
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+  .idle { color: #acb5d4; }
+  .ok { color: #7ef0a8; }
+  .bad { color: #ff9d9d; }
+  .note {
+    color: #acb5d4;
+    font-size: 12px;
+  }
+  #event-log {
+    margin-top: 10px;
+    background: #0f1320;
+    border: 1px solid #39405a;
+    border-radius: 8px;
+    max-height: 180px;
+    overflow: auto;
+    padding: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.35;
+    color: #d5dcf3;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Human MIDI — Live Tipping</h1>
+  <p class="subtitle">Audience tips trigger live musical accents. Demo-safe mode: test/sandbox only.</p>
+
+  <section class="card">
+    <h2>1) Audio Engine WebSocket</h2>
+    <div class="row">
+      <label for="ws-url">WebSocket URL</label>
+      <input id="ws-url" type="text" placeholder="ws://192.168.x.x:8765" spellcheck="false">
+    </div>
+    <div class="inline">
+      <button id="ws-connect" class="primary">Connect</button>
+      <button id="ws-disconnect">Disconnect</button>
+      <button id="send-simulate" class="warn">Simulate Tip (Fallback) · T</button>
+    </div>
+    <p class="note" style="margin-top:8px">Status: <span id="ws-status" class="idle">DISCONNECTED</span> · Sent: <span id="sent-count">0</span></p>
+  </section>
+
+  <section class="card">
+    <h2>2) Unifold Guided Deposit (Sandbox/Testnet)</h2>
+    <div class="row">
+      <label for="unifold-url">Hosted Unifold deposit URL (sandbox/test config)</label>
+      <input id="unifold-url" type="text" placeholder="Paste the Unifold sandbox/test flow URL from your dashboard">
+    </div>
+    <div class="row">
+      <label for="return-url">Return URL after successful deposit (kept on this page)</label>
+      <input id="return-url" type="text" readonly>
+    </div>
+    <div class="row">
+      <label for="demo-recipient">Demo recipient address (fixed for this run)</label>
+      <input id="demo-recipient" type="text" value="0x1111111111111111111111111111111111111111" spellcheck="false">
+    </div>
+    <div class="inline">
+      <button id="open-unifold" class="primary">Open Unifold Flow</button>
+      <button id="mark-confirmed">Mark Deposit Confirmed</button>
+    </div>
+    <p class="note" style="margin-top:8px">If Unifold redirects back with success params, this page auto-sends one <code>tip</code> message.</p>
+  </section>
+
+  <section class="card">
+    <h2>3) Tip Message Payload</h2>
+    <div class="row">
+      <label for="tip-amount">Amount</label>
+      <input id="tip-amount" type="number" step="0.01" min="0.01" value="2.50">
+    </div>
+    <div class="row">
+      <label for="tip-token">Token</label>
+      <input id="tip-token" type="text" value="USDC" maxlength="12">
+    </div>
+    <p class="note">Sent shape: <code>{ "type":"tip", "amount":2.5, "token":"USDC", "timestamp":... }</code></p>
+    <div id="event-log">[boot] ready\n</div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const DEFAULTS = {
+  wsUrl: `ws://${location.hostname || "127.0.0.1"}:8765`,
+  token: "USDC",
+  amount: 2.5,
+  unifoldUrl: "",
+  recipientAddress: "0x1111111111111111111111111111111111111111",
+};
+
+let ws = null;
+let wsOpen = false;
+let sentCount = 0;
+const seenConfirmations = new Set();
+
+function nowIso() {
+  return new Date().toISOString().replace("T", " ").replace("Z", "");
+}
+
+function log(line) {
+  const el = $("event-log");
+  el.textContent += `[${nowIso()}] ${line}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setWsStatus(text, cls) {
+  const el = $("ws-status");
+  el.textContent = text;
+  el.className = cls;
+}
+
+function saveLocal() {
+  localStorage.setItem("hm_tipping_ws_url", $("ws-url").value.trim());
+  localStorage.setItem("hm_tipping_unifold_url", $("unifold-url").value.trim());
+  localStorage.setItem("hm_tipping_recipient", $("demo-recipient").value.trim());
+}
+
+function loadLocal() {
+  $("ws-url").value = localStorage.getItem("hm_tipping_ws_url") || DEFAULTS.wsUrl;
+  $("unifold-url").value = localStorage.getItem("hm_tipping_unifold_url") || DEFAULTS.unifoldUrl;
+  $("demo-recipient").value = localStorage.getItem("hm_tipping_recipient") || DEFAULTS.recipientAddress;
+  $("tip-token").value = DEFAULTS.token;
+  $("tip-amount").value = DEFAULTS.amount.toFixed(2);
+}
+
+function wsConnect(url) {
+  if (!url) {
+    setWsStatus("NO URL", "bad");
+    return;
+  }
+  if (ws) {
+    ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+    try { ws.close(); } catch (_) {}
+    ws = null;
+  }
+  setWsStatus("CONNECTING", "idle");
+  try {
+    ws = new WebSocket(url);
+  } catch (_) {
+    setWsStatus("BAD URL", "bad");
+    return;
+  }
+  ws.onopen = () => {
+    wsOpen = true;
+    setWsStatus("CONNECTED", "ok");
+    log(`ws connected → ${url}`);
+  };
+  ws.onerror = () => {
+    setWsStatus("ERROR", "bad");
+  };
+  ws.onclose = () => {
+    wsOpen = false;
+    setWsStatus("CLOSED", "bad");
+    log("ws closed");
+  };
+}
+
+function wsDisconnect() {
+  if (ws) {
+    ws.onopen = ws.onclose = ws.onerror = ws.onmessage = null;
+    try { ws.close(); } catch (_) {}
+    ws = null;
+  }
+  wsOpen = false;
+  setWsStatus("DISCONNECTED", "idle");
+}
+
+function currentTipPayload() {
+  const amount = Number($("tip-amount").value);
+  const token = ($("tip-token").value || "USDC").trim().toUpperCase();
+  return {
+    type: "tip",
+    amount: Number.isFinite(amount) && amount > 0 ? Number(amount.toFixed(2)) : DEFAULTS.amount,
+    token: token || "USDC",
+    timestamp: Date.now(),
+  };
+}
+
+function sendTip(sourceLabel) {
+  if (!wsOpen || !ws) {
+    log(`[${sourceLabel}] tip not sent — websocket is disconnected`);
+    return false;
+  }
+  const payload = currentTipPayload();
+  try {
+    ws.send(JSON.stringify(payload));
+    sentCount += 1;
+    $("sent-count").textContent = String(sentCount);
+    log(`[${sourceLabel}] tip sent ${JSON.stringify(payload)}`);
+    return true;
+  } catch (err) {
+    log(`[${sourceLabel}] tip send failed: ${err?.message || "unknown error"}`);
+    return false;
+  }
+}
+
+function parseCallbackParams() {
+  const params = new URLSearchParams(location.search);
+  const status = (
+    params.get("status")
+    || params.get("deposit_status")
+    || params.get("unifold_status")
+    || params.get("result")
+    || ""
+  ).toLowerCase();
+  const isSuccess = ["success", "succeeded", "confirmed", "complete", "completed"].includes(status);
+  if (!isSuccess) return;
+
+  const id = (
+    params.get("executionId")
+    || params.get("execution_id")
+    || params.get("transactionHash")
+    || params.get("txHash")
+    || params.get("payment_intent_id")
+    || `status:${status}:ts:${Date.now()}`
+  );
+  if (seenConfirmations.has(id)) return;
+  seenConfirmations.add(id);
+
+  const amountFromCb = Number(params.get("amount"));
+  const tokenFromCb = (params.get("token") || params.get("destinationTokenSymbol") || "").trim();
+  if (Number.isFinite(amountFromCb) && amountFromCb > 0) $("tip-amount").value = amountFromCb.toFixed(2);
+  if (tokenFromCb) $("tip-token").value = tokenFromCb.toUpperCase();
+
+  log(`[callback] success detected (${id})`);
+  sendTip("unifold-callback");
+}
+
+function openUnifold() {
+  const raw = $("unifold-url").value.trim();
+  if (!raw) {
+    log("[unifold] missing hosted flow url");
+    return;
+  }
+  let launchUrl;
+  try {
+    launchUrl = new URL(raw);
+  } catch (_) {
+    log("[unifold] invalid hosted flow url");
+    return;
+  }
+
+  // Keep demo settings explicit on launch: sandbox/test mode + deterministic return.
+  launchUrl.searchParams.set("mode", "test");
+  launchUrl.searchParams.set("sandbox", "true");
+  launchUrl.searchParams.set("recipientAddress", $("demo-recipient").value.trim());
+  launchUrl.searchParams.set("amount", Number($("tip-amount").value).toFixed(2));
+  launchUrl.searchParams.set("token", ($("tip-token").value || "USDC").trim().toUpperCase());
+  launchUrl.searchParams.set("returnUrl", $("return-url").value);
+  launchUrl.searchParams.set("externalUserId", "audience_live_demo");
+
+  saveLocal();
+  log(`[unifold] opening ${launchUrl.origin} (sandbox/test expected)`);
+  window.open(launchUrl.toString(), "_blank", "noopener,noreferrer");
+}
+
+function setup() {
+  loadLocal();
+  const returnUrl = new URL(location.href);
+  returnUrl.search = "";
+  returnUrl.hash = "";
+  $("return-url").value = returnUrl.toString();
+  parseCallbackParams();
+
+  $("ws-connect").onclick = () => {
+    saveLocal();
+    wsConnect($("ws-url").value.trim());
+  };
+  $("ws-disconnect").onclick = wsDisconnect;
+  $("send-simulate").onclick = () => sendTip("simulate-fallback");
+  $("open-unifold").onclick = openUnifold;
+  $("mark-confirmed").onclick = () => sendTip("manual-confirm");
+
+  $("ws-url").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      saveLocal();
+      wsConnect(e.target.value.trim());
+    }
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key.toLowerCase() === "t") sendTip("simulate-fallback-key");
+  });
+}
+
+setup();
+</script>
+</body>
+</html>

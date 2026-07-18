@@ -272,6 +272,23 @@ export function startServer({
         }
       }
 
+      if (message.type === "tip") {
+        const amount = Number(message.amount);
+        const token = typeof message.token === "string" ? message.token.toUpperCase() : "UNKNOWN";
+        if (!Number.isFinite(amount) || amount <= 0) {
+          console.warn("[tip] message missing positive numeric amount — ignored");
+          return;
+        }
+
+        console.log(`[tip] live tip confirmed: ${amount.toFixed(2)} ${token}`);
+        // Additive-only implementation: reuse existing beat synth as a short,
+        // layered double-hit accent without touching biometric/pencil logic.
+        if (playBeat) {
+          playBeat(0.75);
+          setTimeout(() => playBeat(0.45), 120);
+        }
+      }
+
       if (message.type === "pencil") {
         if (
           typeof message.x !== "number" ||
