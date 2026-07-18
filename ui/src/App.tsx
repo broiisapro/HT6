@@ -77,7 +77,7 @@ export default function App() {
 
       <div className="relative mx-auto flex min-h-svh w-full max-w-xl flex-col gap-8 px-6 py-8 sm:px-10 sm:py-12">
         <header>
-          <h1 className="text-sm font-medium uppercase tracking-[0.2em] text-white/50">Human MIDI</h1>
+          <h1 className="text-sm font-medium uppercase tracking-[0.2em] text-white/50">Music From Da Heart</h1>
         </header>
 
         <ModeToggle mode={effectiveMode} onChange={handleModeChange} />
