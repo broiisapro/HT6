@@ -36,6 +36,39 @@ JSON messages — fire-and-forget, no response expected for MVP.
 { "type": "pencil-up", "timestamp": 1737000000000 }
 ```
 
+### Epic 9 addition
+
+```json
+// [ADDITION] Sent by the browser UI (audio-engine/public/) to select performer mode.
+// Received by audio-engine/ only — biometrics/ and pencil-input/ never send this.
+//
+// mode: "static"  — pin one mood zone; heart rate nudges tempo within it
+//                   but never switches zone. `zone` must be provided.
+// mode: "dynamic" — heart rate drives mood zone per the chosen intention.
+//                   `intention` must be provided.
+//
+// zone:      one of "calm" | "focused" | "dreamy" | "energised" (static only; null otherwise)
+// intention: one of "match_my_energy" | "calm_me_down" | "lift_my_energy" (dynamic only; null otherwise)
+{
+  "type": "mode",
+  "mode": "static" | "dynamic",
+  "zone": "<zone-name>" | null,
+  "intention": "<intention>" | null,
+  "timestamp": <epoch-ms>
+}
+
+// [ADDITION] Broadcast by audio-engine/ to all UI clients whenever mode/zone/intention changes.
+// Never sent to biometrics/ or pencil-input/ senders.
+{
+  "type": "state",
+  "mode": "static" | "dynamic",
+  "zone": "<current-zone>" | null,
+  "intention": "<intention>" | null,
+  "pinnedZone": "<zone-name>" | null,
+  "timestamp": <epoch-ms>
+}
+```
+
 Existing `biometric` and `pencil` message shapes are unchanged.
 
 - `bpm`: smoothed beats-per-minute, plausible human range 40–180.
