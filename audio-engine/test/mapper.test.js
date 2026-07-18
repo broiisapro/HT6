@@ -18,6 +18,7 @@ import {
   STRESS_STATE,
   RISE_RATE_THRESHOLD,
   MIN_CONSECUTIVE_SAMPLES,
+  RELEASE_TIME_MS,
   COOLDOWN_MS,
   BED_BPM,
   INPUT_MIN_BPM,
@@ -403,6 +404,38 @@ test("stressMachine: scripted BPM rise sequence reaches PEAK", () => {
     }
   }
   assert.ok(reachedPeak, `Expected PEAK or RELEASING, got ${sm.getState()}`);
+});
+
+test("stressMachine: intensity01 is exactly 0.0 at elapsed = RELEASE_TIME_MS (Fix B — no boundary jump)", () => {
+  // Regression test for the exponential-decay bug where Math.exp(-1) ≈ 0.368
+  // was hard-overridden to 0 in the same tick, causing a ~0.37 gain jump.
+  // The linear decay formula must reach exactly 0 at the boundary with no override.
+  const sm = createStressStateMachine();
+
+  // Step 1: init at t=0.
+  sm.update(70, 0);
+
+  // Step 2-3: scripted rise above RISE_RATE_THRESHOLD for MIN_CONSECUTIVE_SAMPLES.
+  const risePerSec = RISE_RATE_THRESHOLD + 6; // well above threshold
+  sm.update(70 + risePerSec, 1000);   // risingCount = 1
+  sm.update(70 + 2 * risePerSec, 2000); // risingCount = 2 → RISING (risingStartMs=2000, baseline≈70)
+
+  // Step 4: dBpmDt drops → PEAK entered at t=3000; peakEntryMs=3000.
+  sm.update(70 + 2 * risePerSec - 2, 3000); // dBpmDt = -2 <= 0 → PEAK
+  assert.strictEqual(sm.getState(), STRESS_STATE.PEAK, "should be in PEAK after rise reversal");
+
+  // Step 5: PEAK → RELEASING (one tick).
+  sm.update(70 + 2 * risePerSec - 2, 4000);
+  assert.strictEqual(sm.getState(), STRESS_STATE.RELEASING, "should be in RELEASING after PEAK tick");
+
+  // Step 6: advance to exactly peakEntryMs + RELEASE_TIME_MS = 3000 + 6000 = 9000.
+  // BPM is kept far from baseline (baseline ≈ 70, feeding 88 → |88-70|=18 > RELEASE_BAND_BPM=5)
+  // to prevent early-exit via bpmNearBaseline.
+  const intensity = sm.update(70 + 2 * risePerSec - 2, 3000 + RELEASE_TIME_MS);
+
+  // Linear formula: max(0, 1 - 6000/6000) = 0 exactly.
+  assert.strictEqual(intensity, 0, `intensity01 at RELEASE_TIME_MS boundary must be exactly 0, got ${intensity}`);
+  assert.strictEqual(sm.getState(), STRESS_STATE.CALM, "should transition to CALM at boundary");
 });
 
 test("stressMachine: cooldown blocks immediate re-trigger after RELEASING", () => {

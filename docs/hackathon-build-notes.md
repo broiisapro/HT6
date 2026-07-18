@@ -130,7 +130,7 @@ Tests: 80 BPM synthetic sine recovers within 2 BPM (integer-lag quantization err
 
 No pre-existing tests broken.
 
-**Bug caught during Item 6:** `import cv2` and `import numpy as np` were accidentally dropped from `phone_camera.py` during the Item 1/2 import-line edit. Only caught because Item 6 tests tried to call methods that use `np`. Fixed in the Item 6 commit. This underlines the value of running tests — the module loaded fine via `object.__new__()` but the method bodies would crash at runtime. The app would have been broken for camera users.
+**Bug caught during Item 6:** `import cv2` and `import numpy as np` were accidentally dropped from `phone_camera.py` in the **Item 3** (beat-pipeline) commit (`0be541a`), not Item 1/2 as previously stated. Confirmed via `git show 0be541a -- biometrics/human_midi_biometrics/sources/phone_camera.py`: the diff shows `-import cv2` / `-import numpy as np` lines removed in that commit. Item 1/2 (`4b6fc66`) only changed the smoothing import line — `cv2` and `numpy` were still present immediately after that commit. Fixed in the Item 6 commit. The module loaded fine via `object.__new__()` but the method bodies would crash at runtime; only caught because Item 6 tests invoked `np` directly.
 
 ---
 

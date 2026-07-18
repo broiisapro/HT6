@@ -44,8 +44,10 @@ class PhoneCameraPpgSource(BiometricSource):
         # Beat event queue: each entry is a beat timestamp (ms, epoch).
         # Pipeline drains this queue via get_beat_events().
         self._beat_queue: asyncio.Queue[int] = asyncio.Queue()
-        # Watermark: index of the last peak we emitted a beat for.
-        self._last_emitted_peak_idx: int = -1
+        # Timestamp-based watermark: wall-clock time (seconds) of the last peak
+        # we emitted a beat for.  Immune to index drift caused by _trim_window()
+        # popping from the front of the deque each frame.
+        self._last_emitted_peak_ts: float = -1.0
 
     async def start(self) -> None:
         self._capture = cv2.VideoCapture(self.camera_index)
@@ -110,12 +112,17 @@ class PhoneCameraPpgSource(BiometricSource):
             self._red_signal.popleft()
 
     def _emit_new_beats(self, candidate_indices: list, timestamps: "np.ndarray") -> None:
-        """Enqueue beat events for any peaks past the watermark."""
+        """Enqueue beat events for any peaks past the timestamp watermark.
+
+        Uses timestamps rather than deque indices so the watermark is immune
+        to the index drift caused by _trim_window() popping from the front of
+        the deque on every frame.
+        """
         for idx in candidate_indices:
-            if idx > self._last_emitted_peak_idx:
+            if timestamps[idx] > self._last_emitted_peak_ts:
                 beat_ts = int(timestamps[idx] * 1000)  # epoch ms
                 self._beat_queue.put_nowait(beat_ts)
-                self._last_emitted_peak_idx = idx
+                self._last_emitted_peak_ts = timestamps[idx]
 
     def _estimate_bpm(self) -> Optional[float]:
         if len(self._red_signal) < 30:

@@ -256,15 +256,8 @@ export function createStressStateMachine() {
   let calmReturnMs = null;        // timestamp of returning to CALM (for cooldown)
   let intensity01  = 0.0;
 
-  // Attack/release time constants for intensity01 smoothing.
-  const ATTACK_TC_MS  = 200;
-  const RELEASE_TC_MS = RELEASE_TIME_MS;
+  // Rising-state hard ceiling (ms) before forcing PEAK regardless of dBpmDt.
   const RISING_HARD_CEILING_MS = 3000;
-
-  function _decayIntensity(nowMs, referenceMs, tcMs) {
-    const elapsed = nowMs - referenceMs;
-    return Math.exp(-elapsed / tcMs);
-  }
 
   /**
    * Advance the state machine with the next BPM sample.
@@ -323,16 +316,18 @@ export function createStressStateMachine() {
       }
 
       case STRESS_STATE.RELEASING: {
-        // Exponential decay of intensity01.
+        // Linear decay: reaches exactly 0.0 at elapsed = RELEASE_TIME_MS, no
+        // hard override needed. The previous exponential had a ~0.37 jump at
+        // the boundary (Math.exp(-1) then immediately overridden to 0).
+        const elapsed = peakEntryMs !== null ? nowMs - peakEntryMs : Infinity;
         intensity01 = peakEntryMs !== null
-          ? _decayIntensity(nowMs, peakEntryMs, RELEASE_TC_MS)
+          ? Math.max(0, 1 - elapsed / RELEASE_TIME_MS)
           : 0;
 
-        const elapsed = peakEntryMs !== null ? nowMs - peakEntryMs : Infinity;
         const bpmNearBaseline = baseline !== null && Math.abs(bpm - baseline) <= RELEASE_BAND_BPM;
         if (elapsed >= RELEASE_TIME_MS || bpmNearBaseline) {
           state        = STRESS_STATE.CALM;
-          intensity01  = 0;
+          // No intensity01 = 0 override needed: linear formula is already 0 at boundary.
           calmReturnMs = nowMs;
           risingCount  = 0;
         }
