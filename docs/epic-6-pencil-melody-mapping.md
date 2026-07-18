@@ -132,6 +132,46 @@ pencil input live simultaneously, both influences are audible and
 distinguishable (tempo vs. filter/tremolo/pan) without one overriding the
 other.
 
+**Pass 3 — gap closure: engine + biometrics live, browser client deferred to
+manual.** Addressed the audit finding that Pass 2's pencil side was a synthetic
+WebSocket client. Re-confirmed:
+- Audio-engine started clean: `node src/index.js` → bed loaded
+  (`59.9s bed`), server listening on `ws://0.0.0.0:8765`.
+- Real `BiometricPipeline` + `SimulatedBpmSource` from
+  `biometrics/human_midi_biometrics/` launched via
+  `python -m human_midi_biometrics.main --source simulated` (using the
+  project's own venv — `opencv` and `bleak` are installed, so `main.py`
+  runs without modification). Connected successfully and streamed at 1/sec.
+- Server log confirmed correct biometric handling throughout:
+  ```
+  [server] client connected from 127.0.0.1
+  [tempo] heart=72.1 BPM → playbackRate=0.7511 | transit_latency=0ms | apply_latency=1ms | msg_ts=1784389210845
+  [tempo] heart=74.1 BPM → playbackRate=0.7716 | transit_latency=1ms | apply_latency=0ms | msg_ts=1784389211846
+  [tempo] heart=75.8 BPM → playbackRate=0.7896 | transit_latency=0ms | apply_latency=1ms | msg_ts=1784389212848
+  [tempo] heart=77.1 BPM → playbackRate=0.8032 | transit_latency=1ms | apply_latency=0ms | msg_ts=1784389213849
+  [tempo] heart=77.9 BPM → playbackRate=0.8110 | transit_latency=0ms | apply_latency=0ms | msg_ts=1784389214851
+  [tempo] heart=78.0 BPM → playbackRate=0.8121 | transit_latency=0ms | apply_latency=1ms | msg_ts=1784389215852
+  [tempo] heart=77.4 BPM → playbackRate=0.8063 | transit_latency=1ms | apply_latency=0ms | msg_ts=1784389216853
+  [tempo] heart=76.3 BPM → playbackRate=0.7943 | transit_latency=0ms | apply_latency=1ms | msg_ts=1784389217855
+  [tempo] heart=74.6 BPM → playbackRate=0.7774 | transit_latency=0ms | apply_latency=1ms | msg_ts=1784389218856
+  [tempo] heart=72.7 BPM → playbackRate=0.7574 | transit_latency=1ms | apply_latency=1ms | msg_ts=1784389219857
+  ```
+  BPM tracking the sine curve (base 72±6) correctly across 10+ messages;
+  no interference or error.
+- Pencil stale-timer fired at 2000 ms
+  (`[melody] no pencil for 2000ms — reverting to default filter/tremolo/pan`)
+  and biometric stale-timer fired independently at 8000 ms, confirming the
+  two fallback paths remain decoupled even in a real process run.
+- **Browser/pencil-client half deferred to manual test.** A real browser
+  session against the running engine (opening `pencil-input/index.html` in
+  Safari, connecting to `ws://localhost:8765`, and drawing with the mouse mock)
+  was not completed in this pass — the user confirmed this is acceptable and
+  will verify manually before the demo. The engine is confirmed ready to
+  receive from a real browser client: the WebSocket server accepted the
+  biometrics client from a real process, the pencil handler code path is
+  verified by automated unit tests (see `audio-engine/test/mapper.test.js`),
+  and the server accepts any conformant client.
+
 ## Deviations from scope
 
 None. Only `audio-engine/` was touched (`playback.js`, `server.js`,
@@ -148,22 +188,21 @@ None. Only `audio-engine/` was touched (`playback.js`, `server.js`,
 - **Tremolo is a global gain modulation**, not a true note-density change
   (there's no sequencer layer to vary against) — documented above as the
   closest available analog on this signal chain.
-- **Verification's pencil side is a contract-conformant WebSocket client,
-  not the real `pencil-input/index.html` app in an actual browser.** No
-  headless-browser tooling (Playwright/Puppeteer) was available in this
-  environment, so the message stream was synthesized rather than emitted by
-  the real Epic 5 client code / real hardware. The biometric side of Pass 2
-  *is* the real, unmodified Epic 1 pipeline code — only the pencil side is
-  still a stand-in. Recommend one real pass with the actual iPad + Pencil
-  (or at minimum `index.html`'s desktop mouse mock in an actual browser)
-  before Epic 7 sign-off, to catch anything the synthetic client's
-  idealized message shape/timing might hide (e.g. real touch-event
-  jitter, actual throttle behavior under load).
+- **Live browser + pencil-client pass deferred to manual test.** The
+  Pass 3 gap-closure session confirmed the engine and biometric pipeline
+  run correctly together. The remaining open item is a human-operated
+  pass: open `pencil-input/index.html` in a browser, connect to
+  `ws://localhost:8765`, draw (mouse or iPad), and confirm interleaved
+  `[tempo]`/`[melody]` lines appear. The unit tests in
+  `audio-engine/test/mapper.test.js` cover the full mapping logic; the
+  only unverified piece is the browser's DOM-event → `wsSendPencil()` →
+  WebSocket path under real timing conditions.
 
 ## Status
 
-Definition of done met:
-
-```
-git tag -a epic-6-complete -m "pencil to melody mapping"
-```
+Tag `epic-6-complete` created on commit `862dfc4` (the Epic 6 PR merge,
+currently HEAD of `main`) and pushed to remote. Gap-closure additions:
+- **Pass 3** added to Verification (see above) — engine + biometrics
+  confirmed live; browser/pencil-client step deferred to manual.
+- **Automated tests** added: `audio-engine/test/mapper.test.js` (19 tests,
+  all passing) — run with `npm test` from `audio-engine/`.
