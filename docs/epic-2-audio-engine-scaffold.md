@@ -2,20 +2,33 @@
 
 ## Goal
 
-Stand up the audio engine's WebSocket server per the Epic 0 contract and get
-pre-downloaded, royalty-free instrumental beds looping audibly — the
-foundation Epics 3 (biometric → tempo) and 6 (pencil → melody) build on. No
-biometric- or pencil-driven modulation yet; connections are accepted and
-messages are only logged.
+Stand up the audio engine's WebSocket server per the Epic 0 contract, play
+pre-downloaded royalty-free instrumental beds across mood zones, and — since
+this branch's scope grew past the original hand-off point — actually wire
+live heart-rate and Pencil input into zone selection and melody/timbre, the
+work originally slated for Epics 3 and 6.
+
+**Status note:** Epics 3 and 6 were independently implemented and merged to
+`main` while this branch was still in progress, built against the original
+single-`bed.wav` design (see `01-epic-roadmap.md`). This branch's mood-zone
+pivot diverged from that. Rather than leave two incompatible implementations
+to reconcile later, the reusable logic from both (`pencil-mapper.js`
+unchanged, the mapping *shape* of `biometric-mapper.js` adapted) was ported
+in and wired up here directly — see "Key decisions" below. `main`'s versions
+of `index.js`/`playback.js`/`server.js`/`biometric-mapper.js` are superseded
+by this branch for `audio-engine/`; reconciling the two branches is still an
+open step (not done as part of this work — see "Known limitations").
 
 ## How it works
 
 ```
 audio-engine/
   src/
-    index.js     — entry point: warns on empty zone folders, fails only if ALL are empty, starts server + playback
-    server.js    — WebSocket server (contract), logs every message
-    playback.js  — auto-discovers assets/<zone>/ folders, randomly picks a track per zone, exposes switchBed()
+    index.js                  — entry point: warns on empty zone folders, fails only if ALL are empty, starts playback then server
+    server.js                 — WebSocket server (contract); routes biometric -> zone/tempo, pencil -> melody/timbre
+    playback.js               — auto-discovers assets/<zone>/ folders, crossfades between tracks/zones, persistent filter/pan/tremolo chain
+    biometric-zone-mapper.js  — bpm -> zone (debounced) + continuous tempo nudge within a zone
+    pencil-mapper.js          — pencil input -> filter cutoff / tremolo rate / pan (ported unchanged from main's Epic 6)
   scripts/
     fetch-beds.js — one-time download of the seed tracks, NOT run by the live server
   assets/
@@ -43,29 +56,70 @@ get added ahead of their tracks being sourced (this happened for real with
 sourced for it).
 
 - **Server** (`src/server.js`): a `ws` `WebSocketServer` listening on
-  `0.0.0.0:8765` per `contracts/README.md`. On `connection`, it attaches a
-  `message` listener that JSON-parses the payload and logs it — no branching
-  on `type` yet. **Epic 3/6 hook point:** add an `if (message.type === "biometric")` /
-  `"pencil"` branch inside that same listener and call into playback from
-  there, instead of `console.log`.
-- **Playback** (`src/playback.js`): `listZones()` reads `assets/`'s
-  subdirectories; `switchBed(zone)` lists that zone's audio files, picks one
-  at random, decodes it (cached by file path so repeat picks don't re-decode),
-  stops whatever's currently looping, and starts the new track looping.
-  Starts on `calm` if present, otherwise the first playable zone alphabetically.
-  Returns `{ context, switchBed }`. **Epic 3 hook point:** map incoming
-  `{type: "biometric", bpm}` to a zone name (from `listZones()`) — thresholds
-  are Epic 3's call, not decided here — and call `switchBed(zone)` from the WS
-  message handler. `context` also exposes the full native node set
-  (`BiquadFilterNode`, `GainNode`, `playbackRate`, etc.) for finer continuous
-  tempo/filter control on top of whichever track is playing, if Epic 3 wants
-  smoother-than-a-hard-cut transitions between zones. **Epic 6 hook point:**
-  same `context`, for melody/timbre DSP layered on top.
+  `0.0.0.0:8765` per `contracts/README.md`. On `message`, JSON-parses the
+  payload, logs it, then:
+  - `type: "biometric"` → `createZoneTracker()` (from
+    `biometric-zone-mapper.js`) turns `bpm` into a debounced zone; if it
+    differs from the last-applied zone, calls `playback.switchBed(zone)`.
+    Every message also calls `playback.setTempo(rate)`, `rate` from
+    `bpmToPlaybackRateWithinZone(bpm, zone)`. A stale timer (8000ms, same
+    value main's Epic 3 used) reverts tempo to the neutral rate 1.0 if no
+    biometric arrives — it does **not** revert the zone itself; snapping
+    back to a default zone on a brief data gap would be a more jarring,
+    less-motivated crossfade than just holding position.
+  - `type: "pencil"` → smooths `velocity` (EMA, same alpha main's Epic 6
+    used), calls `pencilToAudioParams()`, applies the result via
+    `playback.setMelodyParams({cutoffHz, tremoloHz, pan})`. A separate,
+    shorter stale timer (2000ms) reverts filter/tremolo/pan to their idle
+    defaults via `playback.revertMelodyDefaults()`.
+  All four handles (`switchBed`, `setTempo`, `setMelodyParams`,
+  `revertMelodyDefaults`) come from `startPlayback()`'s return value, passed
+  in as `startServer({ playback })`. If `playback` is omitted, messages are
+  still logged but not applied — lets the server run standalone for testing.
+- **Biometric zone mapping** (`src/biometric-zone-mapper.js`): `ZONE_BANDS`
+  splits the original Epic 3 clamp range (50–130 BPM) into four 20-BPM bands,
+  ordered by energy — `calm` (50–70) < `focused` (70–90) < `dreamy` (90–110)
+  < `energised` (110–130). `classifyZone(bpm)` is a stateless lookup;
+  `createZoneTracker()` wraps it with a `MIN_DWELL_MS` (4000ms) debounce so a
+  bpm sitting on a band edge doesn't flip zones every message — a candidate
+  zone has to persist for the full dwell window before it's actually
+  committed. `bpmToPlaybackRateWithinZone(bpm, zone)` computes a continuous
+  ±8% (`TEMPO_RANGE`) playbackRate nudge from bpm's position *within the
+  given zone's band* — `zone` is passed explicitly (not re-derived from bpm)
+  so that during the dwell window, while the committed zone hasn't caught up
+  to a fast-moving bpm yet, the tempo nudge stays relative to whichever zone
+  is actually still playing (saturating at the band edge) rather than
+  leaking the target zone's math in early.
+- **Playback** (`src/playback.js`): `listZones()`/`listTracks()`/
+  `listPlayableZones()` as before. `startPlayback()` builds a **persistent**
+  effects chain once — `filterNode` (lowpass) → `pannerNode` (stereo) →
+  `tremoloGain` (LFO-modulated, note-density proxy) → `context.destination`
+  — that survives every zone switch; `pencil-mapper.js`'s output targets
+  these three nodes directly and never needs to know a switch happened.
+  `switchBed(zone)` picks a random track from that zone, gives it its own
+  gain node, ramps it in (0→1 over `CROSSFADE_SEC` = 0.6s) while ramping the
+  outgoing track's gain out over the same window, then stops/disconnects the
+  outgoing source once the fade completes — replacing the earlier hard
+  stop/start cut. `setTempo(rate)` and `setMelodyParams(...)` apply to
+  whichever source/chain is currently active without the caller needing to
+  track node identity across switches. Returns
+  `{ context, zone, switchBed, setTempo, setMelodyParams, revertMelodyDefaults }`
+  — `zone` is the resolved starting zone, used by `server.js` to seed its
+  zone tracker so the very first biometric message doesn't trigger a
+  needless switch/crossfade if it lands in the zone already playing.
+- **Pencil melody mapping** (`src/pencil-mapper.js`): ported unchanged from
+  `main`'s Epic 6 — it's a pure function of pencil input (tilt → filter
+  brightness, smoothed velocity → tremolo rate, x → pan) and doesn't know or
+  care what's playing underneath, so it applies to the mood-zone chain
+  as-is. See the file's own docstring for the full mapping rationale
+  (exponential cutoff curve, why `pressure` isn't used — Epic 5 found it's a
+  hardware constant on the demo iPad's USB-C Pencil — etc.).
 - **Entry point** (`src/index.js`): discovers zones via `listZones()`/
   `listPlayableZones()`. Fails only if there are no zone folders at all, or
   every zone is empty; if some (but not all) zones have no tracks yet, logs a
-  non-fatal warning listing which ones and starts anyway. `npm start` runs
-  this.
+  non-fatal warning listing which ones. Starts playback *before* the server
+  (so the server has a real `playback` handle for the first message, not a
+  race). `npm start` runs this.
 - **Bed download** (`scripts/fetch-beds.js`): a manual, one-time script
   (`npm run fetch-beds`) — downloads one seed CC0 track per zone from
   Freesound preview URLs into `assets/<zone>/<name>.mp3`. This only seeds the
@@ -124,16 +178,19 @@ yet; per decision (2)/(3), tracks for it (and any future zone) get added by
 hand directly into `assets/<zone>/`, not through another automated
 search/fetch pass — and it has since been filled in.
 
-This epic prepares the assets, the directory layout, and the `switchBed`
-mechanism only — deliberately **not** wiring zone selection to live bpm (or
-any other signal) values, since picking a zone from a live signal is Epic 3's
-job (biometric → tempo mapping) and the roadmap gates Epic 3 behind Epic 1 (a
-real, tested BPM source) being done. Building that selection logic against
-fake/mocked bpm now would risk tuning thresholds/mappings against data that
-doesn't resemble what Epic 1's actual detector produces — and moods like
-"dreamy" vs. "focused" don't obviously sit on a single bpm axis the way
-calm→energised does, so how a live signal picks among more than three mood
-zones is itself an open design question left to Epic 3, not decided here.
+This epic originally stopped at the assets, the directory layout, and the
+`switchBed` mechanism — deliberately not wiring zone selection to live bpm,
+since that was Epic 3's job and the roadmap gated Epic 3 behind Epic 1 (a
+real, tested BPM source). That gate turned out to already be satisfied:
+Epic 1 finished (Polar Vantage M via phone relay, real hardware-validated)
+before this branch caught up, and Epic 3/6 had *also* already been built and
+merged to `main` — independently, against the old single-bed design. Given
+that, wiring was done here rather than left as a second open branch to
+reconcile: `biometric-zone-mapper.js`'s 20-BPM-band split (see above) is a
+first-pass judgment call, not tuned against real Epic 1 data yet, and
+"dreamy" vs. "focused" still don't obviously sit on a single bpm axis by mood
+alone — flagging this as something to revisit once Epic 7 integration
+actually runs a live performer against it.
 
 **Runtime: Node.js, plain Web Audio API via `node-web-audio-api` — not
 Tone.js.** Tone.js was tried first (per the roadmap's original phrasing), but
@@ -155,20 +212,33 @@ reintroducing Tone.js.
 
 ## WebSocket message-handling interface (current state)
 
-`src/server.js`, inside `wss.on("connection", (socket, req) => { ... })`:
+`src/server.js`, inside `wss.on("connection", (socket, req) => { ... })` —
+now live, not a hook-point comment:
 
 ```js
 socket.on("message", (raw) => {
   const message = JSON.parse(raw.toString());
   console.log(`[server] message from ${remote}:`, message);
-  // Epic 3: if (message.type === "biometric") { const zone = bpmToZone(message.bpm); switchBed(zone); }
-  // Epic 6: if (message.type === "pencil")   { ... drive melody/timbre ... }
+
+  if (message.type === "biometric") {
+    const zone = trackZone(message.bpm); // debounced, biometric-zone-mapper.js
+    const rate = bpmToPlaybackRateWithinZone(message.bpm, zone);
+    if (zone !== currentZone) { currentZone = zone; playback.switchBed(zone); }
+    playback.setTempo(rate);
+  }
+
+  if (message.type === "pencil") {
+    const velocity = smoothVelocity(message.velocity);
+    const params = pencilToAudioParams({ x: message.x, velocity, tilt: message.tilt });
+    playback.setMelodyParams(params);
+  }
 });
 ```
 
 Both message shapes match `contracts/README.md` exactly and were verified
-against a real test client (`ws` client sending both `biometric` and `pencil`
-payloads) — both logged correctly, connect/disconnect logged too.
+against a mock test client (`ws` client sending both `biometric` and
+`pencil` payloads, including a sustained bpm sequence to exercise the zone
+debounce) — see "Verification performed" below.
 
 ## Verification performed
 
@@ -199,8 +269,21 @@ payloads) — both logged correctly, connect/disconnect logged too.
   listen-through before relying on this for a demo, especially once more
   tracks are added per zone.
 - A throwaway `ws` test client connected, sent a `biometric` message per the
-  contract shape, appeared correctly in the server log (still just logged,
-  not acted on), then disconnect was logged.
+  contract shape, appeared correctly in the server log, then disconnect was
+  logged.
+- **Reconciliation wiring** (biometric-zone-mapper.js + pencil-mapper.js +
+  crossfade + persistent effects chain): exercised with a mock client
+  sending a `pencil` message (tilt=70, velocity=900, x=1000) then a sustained
+  `biometric` sequence (bpm=60, then bpm=125 repeated every 800ms). Confirmed:
+  the zone held at `calm` through the ~4s dwell window even though
+  `classifyZone(125)` would immediately say `energised`; the tempo rate
+  during that window computed as `1.08` (top of `calm`'s own band, correctly
+  saturated) rather than leaking `energised`'s band math in early; once the
+  dwell elapsed, the zone committed to `energised` and the rate recomputed
+  to `1.04` (bpm=125's actual position in `energised`'s band); the pencil
+  message produced `cutoff=3857Hz tremolo=3.88Hz pan=0.69`; both stale-data
+  timers fired and reverted correctly when messages stopped. This caught and
+  fixed a real bug during testing — see "Deviations" below.
 
 ## Deviations from scope
 
@@ -228,20 +311,59 @@ payloads) — both logged correctly, connect/disconnect logged too.
   were both updated to tolerate this (warn, don't fail) since zone folders
   are expected to sometimes outpace their track sourcing. It's since been
   filled in along with the rename.
+- Wired Epic 3/6-equivalent logic into this epic directly, rather than
+  leaving it as separate epics to reconcile against `main`'s independent
+  implementation later (see "Status note" at the top). `main`'s
+  `biometric-mapper.js` (continuous playbackRate off one fixed, known-BPM
+  bed) was **not** ported as-is — replaced by `biometric-zone-mapper.js`'s
+  zone-plus-nudge design, since a pool of hand-sourced tracks with no
+  consistent BPM metadata can't support a single global "speed up the
+  track" formula the same way. `pencil-mapper.js` ported with no logic
+  changes (bed-agnostic already). This means `main`'s versions of
+  `index.js`/`playback.js`/`server.js`/`biometric-mapper.js` are superseded
+  for `audio-engine/` by this branch's — merging the two branches will need
+  to resolve that directly (take this branch's versions), not a line-level
+  merge.
+- Found and fixed a real bug during testing, not just a style note: the
+  first draft of `bpmToPlaybackRateWithinZone(bpm)` re-derived its band from
+  `classifyZone(bpm)` internally, so during the multi-second dwell window
+  (zone still `calm` but bpm already in `energised`'s range) the tempo nudge
+  would compute against the *target* zone's band instead of the zone
+  actually still playing. Fixed by having the caller (`server.js`) pass the
+  already-debounced `zone` explicitly into
+  `bpmToPlaybackRateWithinZone(bpm, zone)`.
 
 ## Known limitations
 
-- Zone switches (`switchBed`) are a hard cut — stop one `AudioBufferSourceNode`,
-  start another. No crossfade between zones yet. Same is true of each track's
-  own loop point. If either seam is audible on the demo hardware, add a short
-  crossfade in `playback.js` before Epic 3/6 build further on top.
+- Zone switches now crossfade (600ms), but each track's own **loop point**
+  is still a hard cut (`AudioBufferSourceNode.loop` restarts at sample 0).
+  If that seam is audible on the demo hardware for a particular track, it's
+  a per-track problem (some loop cleanly, some won't) rather than a
+  systemic one.
+- **This branch and `main` have diverged in `audio-engine/`** and haven't
+  been reconciled — `main` has its own working `biometric-mapper.js` /
+  `index.js` / `playback.js` / `server.js` built on the single-bed design
+  (Epics 3 and 6, independently merged). Whoever merges this branch needs
+  to take this branch's versions of those files wholesale, not attempt a
+  line-level git merge — see "Deviations" above.
+- **Not yet tested against real Epic 1/4/5 hardware** — only a mock `ws`
+  client so far. Epic 1's actual bpm range/noise characteristics (Polar
+  Vantage M via phone relay) and Epic 5's actual pencil message rate/jitter
+  (10th-gen iPad + USB-C Pencil) haven't been run through
+  `biometric-zone-mapper.js`'s dwell window or `pencil-mapper.js`'s
+  smoothing yet. This is Epic 7's job (whole-team integration) — pulling
+  `biometrics/`/`pencil-input/` onto this branch requires merging `main` in,
+  which hasn't been done yet (deliberately deferred, not an oversight).
+- The 20-BPM zone bands and `MIN_DWELL_MS`/`TEMPO_RANGE`/`CROSSFADE_SEC`
+  constants in `biometric-zone-mapper.js`/`playback.js` are first-pass
+  judgment calls, not tuned against a live performer — expect to retune
+  once real data is available.
 - This was built and tested on Windows (dev machine), not the Mac used for
   the actual demo — `node-web-audio-api` ships prebuilt macOS binaries so it
-  should work unchanged, but flagging so whoever picks up Epic 3/6 does a
+  should work unchanged, but flagging so whoever integrates next does a
   quick `npm install` + `npm start` sanity check there first.
 - Freesound "hq" previews (128kbps MP3) are used, not the lossless originals
   — fine for a demo, but if audio quality becomes a concern, downloading the
   originals requires adding Freesound API auth to `fetch-beds.js`.
-- No reconnect/backpressure handling on the WebSocket server — fine for this
-  epic's log-only scope, worth revisiting once Epic 3/6 add real-time control
-  loops.
+- No reconnect/backpressure handling on the WebSocket server — fine for a
+  single-performer demo, worth revisiting if that assumption changes.
