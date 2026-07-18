@@ -1,132 +1,254 @@
 /**
- * biometric-zone-mapper.js — Epic 3 (mood-zone version): Biometric-to-Zone Mapping
+ * biometric-zone-mapper.js — Epic 9: Zone-based mood mapping
  *
- * Converts a heart-rate BPM value (from the Epic 1 biometrics pipeline) into
- * one of the mood zones in assets/ (calm/focused/dreamy/energised), plus a
- * small continuous playbackRate nudge within whichever zone is active.
+ * Maps a heart-rate BPM to one of four mood zones, with three performer-
+ * selectable intention strategies:
  *
- * ── Why zones instead of Epic 3's original continuous playbackRate ─────────
- * The original Epic 3 (see git history / main branch) scaled a single fixed
- * fal.ai bed's playbackRate directly proportional to bpm (targetBPM/96).
- * That assumed one bed with one known BPM baked into its generation prompt.
- * This epic's bed is now a pool of hand-sourced, real-world tracks across
- * four mood zones with no consistent known BPM metadata — so a single
- * global "speed up the track" mapping doesn't make sense any more. Instead:
- * bpm picks the zone (the primary, obviously-audible response to heart
- * rate), and a modest ±TEMPO_RANGE playbackRate nudge based on bpm's
- * position *within* that zone's band adds a secondary, continuous layer of
- * responsiveness without requiring per-track BPM data.
+ *   match_my_energy — direct 1:1 mapping (the default). Each of the four
+ *     zones spans an equal 20-BPM window across the 50–130 BPM range.
  *
- * ── Zone bands ───────────────────────────────────────────────────────────
- * Reuses Epic 3's original clamp range (50–130 BPM) split into four equal
- * 20-BPM bands, ordered by arousal/energy (not valence) since that's the
- * one dimension bpm can actually track:
- *   calm (50–70) < focused (70–90) < dreamy (90–110) < energised (110–130)
- * This ordering is a first-pass judgment call, not a validated curve —
- * "dreamy" (upbeat/joyful) and "focused" (relaxed/feel-good) don't
- * obviously sit on a single bpm axis by mood alone, only by energy. Revisit
- * once there's a live performer to actually tune against (Epic 7).
+ *   calm_me_down — resists elevated heart rates; makes it much harder to
+ *     reach the energetic zones and easier to stay in calm/focused.
  *
- * ── Hysteresis / dwell debounce ──────────────────────────────────────────
- * A bpm reading sitting right on a band edge would otherwise flip zones
- * every message. createZoneTracker() requires a candidate zone to be the
- * classification result for MIN_DWELL_MS continuously before it actually
- * commits to switching — short jitter across a boundary doesn't trigger a
- * zone change, sustained movement into a new band does.
+ *   lift_my_energy — accelerates zone progression; the performer reaches
+ *     energised and dreamy at lower heart rates than the default.
+ *
+ * All three strategies route through the same dwell-time hysteresis
+ * (createZoneTracker) so zone flips are debounced identically regardless of
+ * which bands are in use.
+ *
+ * ── match_my_energy (ZONE_BANDS) ─────────────────────────────────────────────
+ * Direct linear mapping: four equal 20-BPM slots across [50, 130].
+ *   calm:      50– 70 BPM
+ *   focused:   70– 90 BPM
+ *   dreamy:    90–110 BPM
+ *   energised: 110–130 BPM
+ *
+ * ── calm_me_down (CALM_ME_DOWN_BANDS) ────────────────────────────────────────
+ * Strategy: shift all zone boundaries UP by ~15 BPM relative to the default.
+ * A performer with an elevated heart rate fights the mapping rather than
+ * mirroring it — the system actively steers toward calm/focused output.
+ *
+ * Design: shift implemented as separate band thresholds (not a subtractive
+ * bias applied before classification). This avoids clamping edge cases and
+ * keeps each strategy self-contained and independently testable.
+ *
+ *   calm:      50– 85 BPM  (35 BPM wide — easy to reach and stay in)
+ *   focused:   85–105 BPM  (20 BPM)
+ *   dreamy:   105–120 BPM  (15 BPM)
+ *   energised: 120–130 BPM (10 BPM — near-unreachable at typical demo HR)
+ *
+ * Concrete contrast vs match_my_energy:
+ *   BPM  80 → match_my_energy: focused  | calm_me_down: calm
+ *   BPM 100 → match_my_energy: dreamy   | calm_me_down: focused
+ *   BPM 115 → match_my_energy: energised| calm_me_down: dreamy
+ *
+ * ── lift_my_energy (LIFT_ME_UP_BANDS) ────────────────────────────────────────
+ * Strategy: shift all zone boundaries DOWN by ~12–15 BPM relative to default.
+ * Even a lightly elevated heart rate pushes into dreamy/energised territory —
+ * the system lifts the mood early and keeps it there.
+ *
+ *   calm:      50– 62 BPM  (12 BPM — graduated out of quickly)
+ *   focused:   62– 77 BPM  (15 BPM)
+ *   dreamy:    77– 95 BPM  (18 BPM)
+ *   energised:  95–130 BPM (35 BPM wide — easy to reach and sustain)
+ *
+ * Concrete contrast vs match_my_energy:
+ *   BPM  65 → match_my_energy: calm     | lift_my_energy: focused
+ *   BPM  80 → match_my_energy: focused  | lift_my_energy: dreamy
+ *   BPM  95 → match_my_energy: dreamy   | lift_my_energy: energised
+ *
+ * ── Tempo nudge ───────────────────────────────────────────────────────────────
+ * bpmToPlaybackRateWithinZone() provides a continuous ±8% tempo nudge within
+ * the active zone. At the zone's low edge the bed plays at 8% below the zone
+ * center; at the high edge, 8% above. Used in static mode (where zone never
+ * changes) so the performer still hears tempo variation without mood shifts.
  */
 
-/** Input clamp bounds (BPM) — matches original Epic 3's range. */
-export const INPUT_MIN_BPM = 50;
-export const INPUT_MAX_BPM = 130;
+import { BED_BPM } from "./biometric-mapper.js";
 
-/** Zone bands, in increasing energy order. */
-export const ZONE_BANDS = [
-  { zone: "calm", min: 50, max: 70 },
-  { zone: "focused", min: 70, max: 90 },
-  { zone: "dreamy", min: 90, max: 110 },
-  { zone: "energised", min: 110, max: 130 },
-];
+export { BED_BPM };
 
-/** Milliseconds a new zone classification must persist before actually switching. */
+/** Minimum milliseconds a candidate zone must persist before confirming a switch. */
 export const MIN_DWELL_MS = 4000;
 
-/** Milliseconds without a biometric message before reverting to default tempo nudge. */
-export const STALE_TIMEOUT_MS = 8000;
-
-/** Continuous playbackRate nudge range applied within a zone's band (±8%). */
-export const TEMPO_RANGE = 0.08;
-
-const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+// ── Zone band tables ────────────────────────────────────────────────────────
 
 /**
- * Classify a raw bpm into one of ZONE_BANDS' zone names (no hysteresis).
- * @param {number} bpm
- * @returns {string} zone name
+ * match_my_energy: four equal 20-BPM zones across [50, 130].
+ * This is the default strategy; classifyZone() uses this table by default.
  */
-export function classifyZone(bpm) {
-  const clamped = clamp(bpm, INPUT_MIN_BPM, INPUT_MAX_BPM);
-  const band = ZONE_BANDS.find((b) => clamped >= b.min && clamped <= b.max) ?? ZONE_BANDS[0];
-  return band.zone;
+export const ZONE_BANDS = {
+  calm:      { low: 50,  high: 70,  center: 60  },
+  focused:   { low: 70,  high: 90,  center: 80  },
+  dreamy:    { low: 90,  high: 110, center: 100 },
+  energised: { low: 110, high: 130, center: 120 },
+};
+
+/**
+ * calm_me_down: shifted thresholds resist energetic zone entry.
+ * calm gets a wide 35-BPM window; energised is compressed to 10 BPM.
+ * See module doc for full reasoning.
+ */
+export const CALM_ME_DOWN_BANDS = {
+  calm:      { low: 50,  high: 85,  center: 67  },
+  focused:   { low: 85,  high: 105, center: 95  },
+  dreamy:    { low: 105, high: 120, center: 112 },
+  energised: { low: 120, high: 130, center: 125 },
+};
+
+/**
+ * lift_my_energy: shifted thresholds encourage energetic zone entry.
+ * energised gets a wide 35-BPM window; calm is compressed to 12 BPM.
+ * See module doc for full reasoning.
+ */
+export const LIFT_ME_UP_BANDS = {
+  calm:      { low: 50,  high: 62,  center: 56  },
+  focused:   { low: 62,  high: 77,  center: 69  },
+  dreamy:    { low: 77,  high: 95,  center: 86  },
+  energised: { low: 95,  high: 130, center: 112 },
+};
+
+/**
+ * Map of intention name → its band table.
+ * Used by server.js to look up the right table from the active intention string.
+ */
+export const INTENTION_BANDS = {
+  match_my_energy: ZONE_BANDS,
+  calm_me_down:    CALM_ME_DOWN_BANDS,
+  lift_my_energy:  LIFT_ME_UP_BANDS,
+};
+
+// ── Classification ──────────────────────────────────────────────────────────
+
+/**
+ * Classify a BPM value into a zone name using the given band table.
+ *
+ * Uses half-open intervals [low, high): a BPM exactly at a boundary (e.g.
+ * 70 BPM in ZONE_BANDS) goes to the HIGHER zone (focused, not calm). BPM
+ * above all bands clamps to the highest zone.
+ *
+ * @param {number} bpm   - Effective BPM (already clamped by biometric-mapper).
+ * @param {object} [bands=ZONE_BANDS] - One of the INTENTION_BANDS values.
+ * @returns {string} Zone name ("calm" | "focused" | "dreamy" | "energised").
+ */
+export function classifyZone(bpm, bands = ZONE_BANDS) {
+  // Sort entries ascending by low threshold — ensures correct order regardless
+  // of insertion order in the band table object.
+  const sorted = Object.entries(bands).sort(([, a], [, b]) => a.low - b.low);
+  for (const [zone, { high }] of sorted) {
+    if (bpm < high) return zone;
+  }
+  // BPM at or above the last zone's high → clamp to last zone.
+  return sorted[sorted.length - 1][0];
 }
 
+// ── Zone tracker (dwell hysteresis) ────────────────────────────────────────
+
 /**
- * Continuous playbackRate nudge based on bpm's position within a *given*
- * zone's band (not necessarily the zone classifyZone(bpm) would pick right
- * now) — e.g. bottom of the band -> 1 - TEMPO_RANGE, top -> 1 + TEMPO_RANGE.
- * Takes `zone` explicitly, rather than re-deriving it from bpm, because the
- * caller's committed zone (after hysteresis/dwell) can legitimately differ
- * from classifyZone(bpm) for a few seconds while a zone change is pending —
- * the tempo nudge during that window must stay relative to whatever zone
- * is actually still playing, not the target zone it's about to switch to.
- * bpm outside the given zone's band clamps (saturates at ±TEMPO_RANGE)
- * rather than extrapolating.
- * @param {number} bpm
- * @param {string} zone - The zone currently active (e.g. from createZoneTracker()).
- * @returns {number} playbackRate
+ * Create a zone tracker that debounces zone switches via a dwell window.
+ *
+ * A candidate zone must persist continuously for at least minDwellMs before
+ * the tracker confirms the switch. A BPM value oscillating around a boundary
+ * (e.g. 89–91 BPM near the focused/dreamy edge) will NOT jitter the zone.
+ *
+ * First update() call confirms immediately (no prior zone to protect).
+ *
+ * Manual mode/zone selections (from type:"mode" WS messages) bypass this
+ * tracker entirely — use forceZone() for those. The dwell window exists to
+ * smooth noisy sensor data; a deliberate UI input is not noisy data.
+ *
+ * @param {number} [minDwellMs=MIN_DWELL_MS] - Dwell window in milliseconds.
+ * @returns {{ update, getZone, forceZone }}
  */
-export function bpmToPlaybackRateWithinZone(bpm, zone) {
-  const band = ZONE_BANDS.find((b) => b.zone === zone) ?? ZONE_BANDS[0];
-  const clamped = clamp(bpm, band.min, band.max);
-  const position01 = (clamped - band.min) / (band.max - band.min); // 0..1 within band
-  return 1 - TEMPO_RANGE + position01 * (2 * TEMPO_RANGE);
+export function createZoneTracker(minDwellMs = MIN_DWELL_MS) {
+  let confirmedZone = null;
+  let pendingZone   = null;
+  let pendingStartMs = null;
+
+  /**
+   * Advance the tracker with a new candidate zone.
+   * @param {string} candidateZone
+   * @param {number} [nowMs=Date.now()]
+   * @returns {{ zone: string, switched: boolean }}
+   */
+  function update(candidateZone, nowMs = Date.now()) {
+    // First update: no prior zone — confirm immediately.
+    if (confirmedZone === null) {
+      confirmedZone = candidateZone;
+      pendingZone   = null;
+      pendingStartMs = null;
+      return { zone: confirmedZone, switched: true };
+    }
+
+    // Candidate matches confirmed — cancel any pending switch.
+    if (candidateZone === confirmedZone) {
+      pendingZone   = null;
+      pendingStartMs = null;
+      return { zone: confirmedZone, switched: false };
+    }
+
+    // Candidate differs from confirmed — start or continue pending dwell.
+    if (candidateZone !== pendingZone) {
+      // New pending candidate (was in a different pending zone before, or
+      // no pending was active). Restart the dwell timer.
+      pendingZone    = candidateZone;
+      pendingStartMs = nowMs;
+    }
+
+    if (nowMs - pendingStartMs >= minDwellMs) {
+      // Dwell elapsed — confirm the switch.
+      confirmedZone  = pendingZone;
+      pendingZone    = null;
+      pendingStartMs = null;
+      return { zone: confirmedZone, switched: true };
+    }
+
+    // Still within dwell window — hold current confirmed zone.
+    return { zone: confirmedZone, switched: false };
+  }
+
+  /** Return the currently confirmed zone (null before first update). */
+  function getZone() { return confirmedZone; }
+
+  /**
+   * Immediately force-set the confirmed zone, bypassing dwell.
+   * Used for manual mode/zone selections from the UI (type:"mode" messages).
+   * @param {string} zone
+   */
+  function forceZone(zone) {
+    confirmedZone  = zone;
+    pendingZone    = null;
+    pendingStartMs = null;
+  }
+
+  return { update, getZone, forceZone };
 }
 
+// ── Tempo nudge within zone ─────────────────────────────────────────────────
+
 /**
- * Create a stateful zone-with-hysteresis tracker. One instance per
- * connection/session.
- * @param {string} [initialZone] - Zone to start committed to.
- * @param {number} [dwellMs]
- * @returns {(bpm: number) => string} track — call once per incoming
- *   biometric message; returns the zone that should actually be active
- *   right now (already debounced — caller can compare to its last-applied
- *   zone to decide whether to call switchBed()).
+ * Compute the playback rate for a ±8% tempo nudge within the active zone.
+ *
+ * The zone's center BPM plays at exactly (center / BED_BPM). Within [low, high]
+ * the rate interpolates ±8% around that center value, giving the performer a
+ * subtle tempo variation that mirrors their heart rate without switching zones.
+ *
+ * BPM outside [low, high] is clamped to the zone boundary, so the nudge
+ * saturates at ±8% — it cannot push the tempo outside the zone's range.
+ *
+ * Used in static mode, where the zone is pinned and the performer hears tempo
+ * variation without any mood shift.
+ *
+ * @param {number} bpm      - Effective BPM (post clamp/rate-limit).
+ * @param {string} zoneName - One of the four zone names.
+ * @param {object} [bands=ZONE_BANDS] - Band table to look up the zone's range.
+ * @returns {number} playbackRate to set on AudioBufferSourceNode.
  */
-export function createZoneTracker(initialZone = "calm", dwellMs = MIN_DWELL_MS) {
-  let committedZone = initialZone;
-  let pendingZone = null;
-  let pendingSince = null;
-
-  return function track(bpm) {
-    const candidate = classifyZone(bpm);
-
-    if (candidate === committedZone) {
-      pendingZone = null;
-      pendingSince = null;
-      return committedZone;
-    }
-
-    if (candidate !== pendingZone) {
-      pendingZone = candidate;
-      pendingSince = Date.now();
-      return committedZone;
-    }
-
-    if (Date.now() - pendingSince >= dwellMs) {
-      committedZone = candidate;
-      pendingZone = null;
-      pendingSince = null;
-    }
-
-    return committedZone;
-  };
+export function bpmToPlaybackRateWithinZone(bpm, zoneName, bands = ZONE_BANDS) {
+  const { low, high, center } = bands[zoneName];
+  const clamped = Math.max(low, Math.min(high, bpm));
+  const pos     = (clamped - low) / (high - low);  // 0..1 within zone
+  const nudge   = 0.92 + pos * 0.16;               // 0.92..1.08 (±8%)
+  return (center / BED_BPM) * nudge;
 }

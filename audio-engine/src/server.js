@@ -9,8 +9,12 @@ import {
   STALE_TIMEOUT_MS,
 } from "./biometric-mapper.js";
 import {
+  ZONE_BANDS,
+  INTENTION_BANDS,
+  classifyZone,
   createZoneTracker,
   bpmToPlaybackRateWithinZone,
+  MIN_DWELL_MS,
 } from "./biometric-zone-mapper.js";
 import {
   pencilToAudioParams,
@@ -22,8 +26,64 @@ import {
 const HOST = "0.0.0.0";
 const PORT = 8765;
 
-/** Minimum milliseconds between forwarded beat events (server-side debounce). */
-const BEAT_DEBOUNCE_MS = 300;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(__dirname, "..", "public");
+
+const VALID_ZONES = ZONE_BANDS.map((b) => b.zone);
+const VALID_INTENTIONS = Object.keys(INTENTION_CLASSIFIERS);
+
+const MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+};
+
+/**
+ * Epic 9: minimal static file server for the mode-selector UI
+ * (`audio-engine/public/`, built from the sibling `ui/` sub-package via
+ * `npm run build:ui`). Attached to the *same* HTTP server the WebSocket
+ * server upgrades from — one port (8765) for everything, so a performer on
+ * the LAN only needs one address (`http://<mac-ip>:8765` for the UI,
+ * `ws://<mac-ip>:8765` for the contract socket) rather than remembering two
+ * ports. `ws`'s `WebSocketServer` only intercepts the HTTP `upgrade` event;
+ * plain GET requests fall through to this listener untouched.
+ */
+async function serveStatic(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  let filePath = url.pathname === "/" ? "/index.html" : url.pathname;
+  filePath = path.normalize(filePath).replace(/^(\.\.[/\\])+/, "");
+  const resolved = path.join(PUBLIC_DIR, filePath);
+
+  try {
+    const data = await readFile(resolved);
+    const ext = path.extname(resolved).toLowerCase();
+    res.writeHead(200, { "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream" });
+    res.end(data);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      // SPA fallback: unknown paths (client-side routes, none currently) serve index.html.
+      try {
+        const data = await readFile(path.join(PUBLIC_DIR, "index.html"));
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(data);
+      } catch {
+        res.writeHead(404);
+        res.end("Not found");
+      }
+    } else {
+      res.writeHead(500);
+      res.end("Internal error");
+    }
+  }
+}
 
 /**
  * Contract WebSocket server (see ../../contracts/README.md).
@@ -65,6 +125,12 @@ export function startServer({
   applyStressIntensity = null,
   playBeat = null,
   playPluck = null,
+  // Epic 9: switchBed(zoneName) crossfades audio profile on zone switch.
+  // Provided by startPlayback(); null means zone tracking still runs but no
+  // audio profile change is applied (useful for headless testing).
+  switchBed = null,
+  // Epic 9: dwell window override for tests. undefined → use MIN_DWELL_MS.
+  zoneDwellMs = undefined,
 } = {}) {
   const wss = new WebSocketServer({ host: HOST, port: PORT });
 
@@ -88,6 +154,58 @@ export function startServer({
   // Toggled at runtime by setOppositeMood / setStaticMode (returned below).
   let oppositeMoodEnabled = false;
   let staticModeEnabled   = false;
+
+  // ── Epic 9: zone / mode / intention state ────────────────────────────────
+  // Boots into dynamic / match_my_energy per spec. In-memory only.
+  //
+  // serverMode:      "dynamic" | "static"  — current performer mode.
+  // activeIntention: intention name for dynamic mode.
+  // pinnedZone:      zone name for static mode (null in dynamic).
+  // activeZone:      the zone currently confirmed by the tracker (dynamic) or
+  //                  pinned (static). null until first biometric arrives.
+  let serverMode       = "dynamic";
+  let activeIntention  = "match_my_energy";
+  let pinnedZone       = null;
+  let activeZone       = null;
+
+  // Zone tracker: debounces biometric-driven zone switches (dynamic mode).
+  // Manual mode/zone WS messages bypass this via zoneTracker.forceZone().
+  const zoneTracker = createZoneTracker(
+    zoneDwellMs !== undefined ? zoneDwellMs : MIN_DWELL_MS
+  );
+
+  // ── Epic 9: UI client registry + state broadcast ─────────────────────────
+  // Sockets that send a type:"mode" message are tagged as UI clients.
+  // Only UI clients receive state broadcast payloads (biometric/pencil senders
+  // are fire-and-forget and never expect a response).
+  const uiClients = new Set();
+
+  /**
+   * Build and send the current mode/zone/intention state to all UI clients.
+   * Called on every zone switch (dynamic mode) and on every mode message.
+   */
+  function broadcastState() {
+    const payload = JSON.stringify({
+      type:      "state",
+      mode:      serverMode,
+      zone:      activeZone,
+      intention: serverMode === "dynamic" ? activeIntention : null,
+      pinnedZone: serverMode === "static" ? pinnedZone : null,
+      timestamp: Date.now(),
+    });
+    let sent = 0;
+    for (const client of uiClients) {
+      if (client.readyState === 1 /* WebSocket.OPEN */) {
+        client.send(payload);
+        sent++;
+      }
+    }
+    if (sent > 0) {
+      console.log(`[mode/broadcast] → ${sent} UI client(s): mode=${serverMode}` +
+        ` zone=${activeZone} intention=${activeIntention ?? "n/a"}` +
+        ` pinnedZone=${pinnedZone ?? "n/a"}`);
+    }
+  }
 
   function setOppositeMood(enabled) {
     oppositeMoodEnabled = !!enabled;
@@ -196,6 +314,41 @@ export function startServer({
           return;
         }
 
+        // Epic 8.5 pipeline: clamp → rate-limit → (optional invert).
+        const clamped = clampBpm(message.bpm);
+        const limited = rateLimiter(clamped, rxTime);
+        const effective = oppositeMoodEnabled ? applyMoodInversion(limited) : limited;
+
+        // Epic 9: zone-aware rate routing.
+        //
+        // Static mode: zone is pinned by the performer. Compute a ±8% tempo
+        //   nudge within pinnedZone using bpmToPlaybackRateWithinZone() so the
+        //   music tempo still reflects HR without ever switching mood zones.
+        //
+        // Dynamic mode: classify BPM into a zone per the active intention's
+        //   band table, run through dwell hysteresis, call switchBed() on
+        //   confirmed zone switches, then use the direct BPM/BED_BPM rate
+        //   (preserving the existing linear tempo feel for this mode).
+        let rate;
+        let zoneStr = "";
+        if (serverMode === "static") {
+          rate = bpmToPlaybackRateWithinZone(effective, pinnedZone);
+          zoneStr = ` [static zone=${pinnedZone}]`;
+        } else {
+          // Dynamic: zone tracking + switchBed, then direct rate.
+          const bands = INTENTION_BANDS[activeIntention];
+          const candidate = classifyZone(effective, bands);
+          const { zone, switched } = zoneTracker.update(candidate, rxTime);
+          if (switched) {
+            const prev = activeZone;
+            activeZone = zone;
+            console.log(`[zone] ${prev ?? "none"} → ${activeZone} (intention=${activeIntention})`);
+            if (switchBed) switchBed(activeZone);
+            broadcastState();
+          }
+          zoneStr = ` [zone=${activeZone ?? "pending"}]`;
+          rate = effective / BED_BPM;
+        }
         // Epic 8.5 pipeline: clamp → rate-limit → (optional invert) → zone + rate.
         const clamped   = clampBpm(message.bpm);
         const limited   = rateLimiter(clamped, rxTime);
@@ -211,6 +364,26 @@ export function startServer({
           console.log(`[stress] ${prevState} → ${newState} (intensity=${intensity01.toFixed(3)})`);
         }
 
+        if (sourceNode) {
+          sourceNode.playbackRate.value = rate;
+          const applyTime = Date.now();
+          const transitLatency = typeof message.timestamp === "number"
+            ? rxTime - message.timestamp
+            : null;
+          const rateLimitedStr = limited !== clamped
+            ? ` (rate-limited from ${clamped.toFixed(1)})`
+            : "";
+          const moodStr = oppositeMoodEnabled ? ` [mood-inverted: raw-clamped=${clamped.toFixed(1)}]` : "";
+          console.log(
+            `[tempo] heart=${message.bpm.toFixed(1)} BPM` +
+            ` → effective=${effective.toFixed(1)} BPM${rateLimitedStr}${moodStr}${zoneStr}` +
+            ` → playbackRate=${rate.toFixed(4)}` +
+            ` | transit_latency=${transitLatency !== null ? transitLatency + "ms" : "n/a"}` +
+            ` | apply_latency=${applyTime - rxTime}ms` +
+            ` | msg_ts=${message.timestamp}`
+          );
+        } else {
+          console.log(`[tempo] biometric received but no sourceNode — heart=${message.bpm} BPM (no-op)`);
         // Zone tracking: switch bed if BPM moved to a new zone (with hysteresis).
         const zone     = trackZone(effective);
         const zoneRate = bpmToPlaybackRateWithinZone(effective, zone);
@@ -242,6 +415,50 @@ export function startServer({
           ` | apply_latency=${applyTime - rxTime}ms` +
           ` | msg_ts=${message.timestamp}`
         );
+      }
+
+      // ── Epic 9: type:"mode" — performer mode/intention/zone selection ──────
+      // Receiving this message tags the sender as a UI client: it will receive
+      // state broadcast payloads on every zone switch and mode change.
+      // Multiple UI clients are supported (e.g. performer + stage monitor tabs).
+      if (message.type === "mode") {
+        // Tag this socket as a UI client (idempotent).
+        if (!socket._isUiClient) {
+          socket._isUiClient = true;
+          uiClients.add(socket);
+          console.log(`[mode] socket ${remote} registered as UI client (${uiClients.size} total)`);
+        }
+
+        const { mode, zone, intention } = message;
+
+        if (mode === "static") {
+          if (!zone || !ZONE_BANDS[zone]) {
+            console.warn(`[mode] static: invalid zone "${zone}" — must be one of: ${Object.keys(ZONE_BANDS).join(", ")}`);
+            return;
+          }
+          serverMode = "static";
+          pinnedZone = zone;
+          activeZone = zone;                // update display zone immediately
+          zoneTracker.forceZone(zone);      // sync tracker for when we return to dynamic
+          console.log(`[mode] → static  pinnedZone=${pinnedZone}`);
+
+        } else if (mode === "dynamic") {
+          if (!intention || !INTENTION_BANDS[intention]) {
+            console.warn(`[mode] dynamic: invalid intention "${intention}" — must be one of: ${Object.keys(INTENTION_BANDS).join(", ")}`);
+            return;
+          }
+          serverMode = "dynamic";
+          activeIntention = intention;
+          pinnedZone = null;
+          console.log(`[mode] → dynamic  intention=${activeIntention}`);
+
+        } else {
+          console.warn(`[mode] unknown mode "${mode}" — ignored`);
+          return;
+        }
+
+        // Broadcast updated state to all UI clients (including the sender).
+        broadcastState();
       }
 
       if (message.type === "pencil-down") {
@@ -328,7 +545,13 @@ export function startServer({
     });
 
     socket.on("close", () => {
-      console.log(`[server] client disconnected: ${remote}`);
+      // Epic 9: deregister UI clients so broadcasts don't pile up on dead sockets.
+      if (socket._isUiClient) {
+        uiClients.delete(socket);
+        console.log(`[server] UI client disconnected: ${remote} (${uiClients.size} remaining)`);
+      } else {
+        console.log(`[server] client disconnected: ${remote}`);
+      }
     });
 
     socket.on("error", (err) => {

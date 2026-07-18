@@ -1,5 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { emitKeypressEvents } from "node:readline";
 import { startServer } from "./server.js";
 import { startPlayback, listZones, listPlayableZones } from "./playback.js";
@@ -16,6 +18,49 @@ async function main() {
     return;
   }
 
+  const playable = await listPlayableZones();
+  if (playable.length === 0) {
+    console.error(`[index] every zone folder is empty under ${ASSETS_DIR}. Add tracks to at least one zone.`);
+    process.exitCode = 1;
+    return;
+  }
+  const empty = zones.filter((zone) => !playable.includes(zone));
+  if (empty.length > 0) {
+    console.warn(`[index] zone(s) with no tracks yet (not selectable until filled): ${empty.join(", ")}`);
+  }
+
+  // ── Auto-start polar-phone-relay ───────────────────────────────────────
+  // Spawns the biometrics polar-phone-relay so `npm start` brings up the
+  // full stack in one command. iPhone app POSTs HR to http://<mac-ip>:8766/hr;
+  // relay smooths + forwards as WS biometric messages to this server on 8765.
+  const BIOMETRICS_DIR = path.join(__dirname, "..", "..", "biometrics");
+  const PYTHON = path.join(BIOMETRICS_DIR, ".venv", "bin", "python");
+  const RELAY_SCRIPT = path.join(BIOMETRICS_DIR, "run.py");
+
+  if (existsSync(PYTHON) && existsSync(RELAY_SCRIPT)) {
+    const relay = spawn(PYTHON, [
+      RELAY_SCRIPT,
+      "--source", "polar-phone-relay",
+      "--websocket-url", "ws://127.0.0.1:8765",
+    ], { cwd: BIOMETRICS_DIR, stdio: "inherit" });
+    relay.on("error", (err) => console.error("[polar-relay] failed to start:", err.message));
+    relay.on("exit", (code) => console.log(`[polar-relay] exited (code=${code})`));
+    // Kill relay when this process exits.
+    process.on("exit", () => relay.kill());
+    process.on("SIGINT", () => { relay.kill(); process.exit(0); });
+    console.log("[polar-relay] started — iPhone app → POST http://<mac-ip>:8766/hr");
+  } else {
+    console.warn("[polar-relay] biometrics/.venv not found — skipping auto-start (run manually if needed)");
+  }
+
+  // Epic 3: start playback first so we have sourceNode to pass to the server.
+  // (Order changed from Epic 2: server was first, but the server now needs the
+  // sourceNode returned by startPlayback() to drive playbackRate on biometric
+  // messages. Playback is fast — decoding ~60 s of WAV typically takes <50 ms
+  // — so this doesn't meaningfully delay the server becoming available.)
+  // Epic 6: also pass through filterNode/pannerNode/lfo for pencil-driven
+  // melody/timbre.
+  const { sourceNode, filterNode, pannerNode, lfo, playBeat, applyStressIntensity, playPluck, switchBed } = await startPlayback();
   const playable = await listPlayableZones();
   if (playable.length === 0) {
     console.error(`[index] every zone folder is empty under ${ASSETS_DIR}. Add tracks to at least one zone.`);

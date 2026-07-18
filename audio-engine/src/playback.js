@@ -29,6 +29,43 @@ const DEFAULT_ZONE = "calm";
 /** Crossfade duration (seconds) when switching zones. */
 const CROSSFADE_SEC = 0.6;
 
+/** Tremolo (Epic 6) gain-modulation constants — see playback.js on main for origin. */
+const TREMOLO_BASE_GAIN = 0.85;
+const TREMOLO_DEPTH = 0.15; // gain oscillates in [BASE-DEPTH, BASE+DEPTH] = [0.7, 1.0]
+
+/**
+ * Zones are whatever subdirectories exist under assets/ — not hardcoded.
+ * Drop more tracks into an existing zone's folder (e.g. assets/calm/) and
+ * they join that zone's random pool automatically; add a new zone folder
+ * (e.g. assets/epic/) and it becomes selectable with no code change.
+ */
+export async function listZones() {
+  const entries = await readdir(ASSETS_DIR, { withFileTypes: true });
+  return entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+}
+
+export async function listTracks(zone) {
+  const zoneDir = path.join(ASSETS_DIR, zone);
+  const entries = await readdir(zoneDir, { withFileTypes: true });
+  return entries
+    .filter((e) => e.isFile() && AUDIO_EXTENSIONS.has(path.extname(e.name).toLowerCase()))
+    .map((e) => path.join(zoneDir, e.name));
+}
+
+/** Zones that currently have at least one track — the only ones startable/selectable right now. */
+export async function listPlayableZones() {
+  const zones = await listZones();
+  const results = await Promise.all(zones.map(async (zone) => ((await listTracks(zone)).length > 0 ? zone : null)));
+  return results.filter((zone) => zone !== null);
+}
+
+function pickRandom(list) {
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+/** Crossfade duration (seconds) when switching zones. */
+const CROSSFADE_SEC = 0.6;
+
 /** Tremolo (Epic 6) gain-modulation constants. */
 const TREMOLO_BASE_GAIN = 0.85;
 const TREMOLO_DEPTH = 0.15; // gain oscillates in [BASE-DEPTH, BASE+DEPTH] = [0.7, 1.0]
@@ -100,6 +137,15 @@ export async function startPlayback(initialZone) {
   filterNode.type = "lowpass";
   filterNode.frequency.value = DEFAULT_CUTOFF_HZ;
 
+  const sourceNode = context.createBufferSource();
+  sourceNode.buffer = audioBuffer;
+  sourceNode.loop = true;
+
+  // Epic 6 melody/timbre chain.
+  const filterNode = context.createBiquadFilter();
+  filterNode.type = "lowpass";
+  filterNode.frequency.value = DEFAULT_CUTOFF_HZ;
+
   const pannerNode = context.createStereoPanner();
   pannerNode.pan.value = DEFAULT_PAN;
 
@@ -163,6 +209,51 @@ export async function startPlayback(initialZone) {
       tremoloGain.gain.setTargetAtTime(TREMOLO_BASE_GAIN, now + 0.15, STRESS_RECOVER_TC);
     }
   }
+
+  // ── Epic 9: zone audio profiles ─────────────────────────────────────────
+  // Each zone has a distinct audio character expressed via filter cutoff and
+  // tremolo rate. switchBed() crossfades between profiles smoothly.
+  //
+  // Profile values chosen for audible differentiation:
+  //   calm      — dark (400 Hz lowpass) + slow tremolo (0.4 Hz) → muted, restful
+  //   focused   — mid-bright (2000 Hz) + moderate tremolo (1.0 Hz) → alert, steady
+  //   dreamy    — bright (4500 Hz) + flowing tremolo (2.5 Hz) → spacious, floating
+  //   energised — very bright (8000 Hz) + fast tremolo (5.0 Hz) → vivid, excited
+  //
+  // Note: pencil-mapper.js also drives filterNode.frequency and lfo.frequency.
+  // Pencil input (arriving at ~30 msg/s) overrides zone values in practice —
+  // the zone profile is the ambient baseline that pencil modulates on top of.
+  // This is acceptable for the hackathon demo scope.
+  const ZONE_PROFILES = {
+    calm:      { filterHz: 400,  tremoloHz: 0.4 },
+    focused:   { filterHz: 2000, tremoloHz: 1.0 },
+    dreamy:    { filterHz: 4500, tremoloHz: 2.5 },
+    energised: { filterHz: 8000, tremoloHz: 5.0 },
+  };
+
+  // TC = 0.5s → ~3 TC = 1.5s for a natural crossfade between zone profiles.
+  const ZONE_CROSSFADE_TC = 0.5;
+
+  /**
+   * Crossfade audio parameters to match the given zone's profile.
+   * Called by server.js on every confirmed zone switch (dynamic mode only).
+   * No-op in static mode — zone is pinned, no profile switch needed.
+   * @param {string} zoneName - One of the four zone names.
+   */
+  function switchBed(zoneName) {
+    const profile = ZONE_PROFILES[zoneName];
+    if (!profile) {
+      console.warn(`[playback] switchBed: unknown zone "${zoneName}" — ignored`);
+      return;
+    }
+    const now = context.currentTime;
+    filterNode.frequency.setTargetAtTime(profile.filterHz, now, ZONE_CROSSFADE_TC);
+    lfo.frequency.setTargetAtTime(profile.tremoloHz, now, ZONE_CROSSFADE_TC);
+    console.log(`[playback] zone → ${zoneName} (filter=${profile.filterHz}Hz tremolo=${profile.tremoloHz}Hz)`);
+  }
+
+  const tremoloGain = context.createGain();
+  tremoloGain.gain.value = TREMOLO_BASE_GAIN;
 
   /**
    * Fire one low-sine thump for a detected heartbeat.

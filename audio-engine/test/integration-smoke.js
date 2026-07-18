@@ -47,12 +47,14 @@ const origWarn = console.warn.bind(console);
 console.log  = (...a) => { const s = a.join(" "); logLines.push(s); origLog(s); };
 console.warn = (...a) => { const s = a.join(" "); logLines.push(s); origWarn(s); };
 
-// ── Start server with mock nodes ─────────────────────────────────────────────
-const wss = startServer({
+// ── Start server with mock nodes ─────────────────────────────────────────────────────
+// startServer() returns { wss, setOppositeMood, setStaticMode } — destructure wss.
+const { wss } = startServer({
   sourceNode: mockSourceNode,
   filterNode: mockFilterNode,
   pannerNode: mockPannerNode,
   lfo: mockLfo,
+  zoneDwellMs: 0,  // instant zone switches so rate stays BPM/BED_BPM as expected
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -126,15 +128,19 @@ async function runTests() {
     `pencil x=${x} → pan ≈ 0, got ${mockPannerNode.pan.value.toFixed(3)}`
   );
 
-  // ── Test 3: biometric while pencil is connected (interleave check) ────────
+  // ── Test 3: biometric while pencil is connected (interleave check) ────
   const bpmIn2    = 103;
-  const expectedRate2 = bpmIn2 / 96;
+  // The rate limiter caps BPM change at MAX_BPM_CHANGE_PER_SEC (10 BPM/s) so the
+  // effective BPM after a short ~60ms gap is only slightly above bpmIn (85).
+  // We assert the rate INCREASED toward bpmIn2/96 (message was applied) rather
+  // than an exact value that depends on actual elapsed wall-clock time.
+  const rateAfterFirst = bpmIn / 96;   // rate from test 1
   await wsSend(bioWs, { type: "biometric", bpm: bpmIn2, timestamp: Date.now() });
   await delay(30);
 
   assert(
-    Math.abs(mockSourceNode.playbackRate.value - expectedRate2) < 0.0001,
-    `interleaved biometric 103 BPM → playbackRate ~${expectedRate2.toFixed(4)}, got ${mockSourceNode.playbackRate.value.toFixed(4)}`
+    mockSourceNode.playbackRate.value > rateAfterFirst,
+    `interleaved biometric ${bpmIn2} BPM should increase rate above ${rateAfterFirst.toFixed(4)}, got ${mockSourceNode.playbackRate.value.toFixed(4)}`
   );
 
   // Pencil params must be unchanged (tempo change must not affect melody nodes).
