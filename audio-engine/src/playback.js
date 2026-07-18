@@ -142,6 +142,48 @@ export async function startPlayback() {
     }
   }
 
+  // ── Epic 9: zone audio profiles ─────────────────────────────────────────
+  // Each zone has a distinct audio character expressed via filter cutoff and
+  // tremolo rate. switchBed() crossfades between profiles smoothly.
+  //
+  // Profile values chosen for audible differentiation:
+  //   calm      — dark (400 Hz lowpass) + slow tremolo (0.4 Hz) → muted, restful
+  //   focused   — mid-bright (2000 Hz) + moderate tremolo (1.0 Hz) → alert, steady
+  //   dreamy    — bright (4500 Hz) + flowing tremolo (2.5 Hz) → spacious, floating
+  //   energised — very bright (8000 Hz) + fast tremolo (5.0 Hz) → vivid, excited
+  //
+  // Note: pencil-mapper.js also drives filterNode.frequency and lfo.frequency.
+  // Pencil input (arriving at ~30 msg/s) overrides zone values in practice —
+  // the zone profile is the ambient baseline that pencil modulates on top of.
+  // This is acceptable for the hackathon demo scope.
+  const ZONE_PROFILES = {
+    calm:      { filterHz: 400,  tremoloHz: 0.4 },
+    focused:   { filterHz: 2000, tremoloHz: 1.0 },
+    dreamy:    { filterHz: 4500, tremoloHz: 2.5 },
+    energised: { filterHz: 8000, tremoloHz: 5.0 },
+  };
+
+  // TC = 0.5s → ~3 TC = 1.5s for a natural crossfade between zone profiles.
+  const ZONE_CROSSFADE_TC = 0.5;
+
+  /**
+   * Crossfade audio parameters to match the given zone's profile.
+   * Called by server.js on every confirmed zone switch (dynamic mode only).
+   * No-op in static mode — zone is pinned, no profile switch needed.
+   * @param {string} zoneName - One of the four zone names.
+   */
+  function switchBed(zoneName) {
+    const profile = ZONE_PROFILES[zoneName];
+    if (!profile) {
+      console.warn(`[playback] switchBed: unknown zone "${zoneName}" — ignored`);
+      return;
+    }
+    const now = context.currentTime;
+    filterNode.frequency.setTargetAtTime(profile.filterHz, now, ZONE_CROSSFADE_TC);
+    lfo.frequency.setTargetAtTime(profile.tremoloHz, now, ZONE_CROSSFADE_TC);
+    console.log(`[playback] zone → ${zoneName} (filter=${profile.filterHz}Hz tremolo=${profile.tremoloHz}Hz)`);
+  }
+
   console.log(`[playback] looping ${BED_PATH} (${audioBuffer.duration.toFixed(1)}s bed)`);
 
   /**
@@ -218,5 +260,5 @@ export async function startPlayback() {
     _pluckGain = gain;
   }
 
-  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity, playPluck };
+  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity, playPluck, switchBed };
 }
