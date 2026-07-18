@@ -21,8 +21,10 @@ async function main() {
   // sourceNode returned by startPlayback() to drive playbackRate on biometric
   // messages. Playback is fast — decoding ~60 s of WAV typically takes <50 ms
   // — so this doesn't meaningfully delay the server becoming available.)
-  const { sourceNode } = await startPlayback();
-  startServer({ sourceNode });
+  // Epic 6: also pass through filterNode/pannerNode/lfo for pencil-driven
+  // melody/timbre.
+  const { sourceNode, filterNode, pannerNode, lfo } = await startPlayback();
+  startServer({ sourceNode, filterNode, pannerNode, lfo });
 }
 
 main().catch((err) => {
