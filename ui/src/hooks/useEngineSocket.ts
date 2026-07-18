@@ -71,6 +71,13 @@ export function useEngineSocket() {
     };
   }, []);
 
+  const sendSimulateHeartAttack = useCallback(() => {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ type: "simulate-heart-attack", timestamp: Date.now() }));
+    return true;
+  }, []);
+
   const sendMode = useCallback(
     (mode: EngineMode, zone: Zone | null, intention: Intention | null) => {
       const socket = socketRef.current;
@@ -81,5 +88,5 @@ export function useEngineSocket() {
     []
   );
 
-  return { status, state, sendMode };
+  return { status, state, sendMode, sendSimulateHeartAttack };
 }

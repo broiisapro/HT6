@@ -12,7 +12,7 @@
     "generate-bed": "node scripts/generate-bed.js",
     "prepare-stems": "node scripts/prepare-stems.js",
     "generate-stems": "node scripts/generate-stems.js",
-    "test": "node --test test/mapper.test.js"
+    "test": "node --test test/mapper.test.js test/emergency-caller.test.js"
   },
   "devDependencies": {
     "concurrently": "^10.0.3"

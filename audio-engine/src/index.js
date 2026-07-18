@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { emitKeypressEvents } from "node:readline";
 import { startServer } from "./server.js";
 import { startPlayback, listZones, listPlayableZones } from "./playback.js";
@@ -9,6 +9,35 @@ import { FallbackPlayer } from "./fallback-player.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ASSETS_DIR = path.join(__dirname, "..", "assets");
+
+// ── Minimal .env loader (no dotenv dependency) ─────────────────────────────
+// Reads audio-engine/.env if present and sets any var not already in
+// process.env. Hand-rolled instead of the `dotenv` package because that
+// package is referenced elsewhere in this repo but isn't actually installed
+// (npm registry access is unavailable in some build environments) — this
+// avoids a new dependency entirely. Silently no-ops if the file is missing.
+function loadEnvFile() {
+  const envPath = path.join(__dirname, "..", ".env");
+  let raw;
+  try {
+    raw = readFileSync(envPath, "utf-8");
+  } catch {
+    return;
+  }
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+loadEnvFile();
 
 async function main() {
   const zones = await listZones();

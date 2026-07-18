@@ -29,6 +29,7 @@ import {
   DEFAULT_PAN,
   STALE_TIMEOUT_MS as PENCIL_STALE_TIMEOUT_MS,
 } from "./pencil-mapper.js";
+import { placeEmergencyCall } from "./emergency-caller.js";
 
 const HOST = "0.0.0.0";
 const PORT = 8765;
@@ -192,6 +193,10 @@ export function startServer({
   const zoneTracker = createZoneTracker(
     zoneDwellMs !== undefined ? zoneDwellMs : MIN_DWELL_MS
   );
+
+  // ── simulate-heart-attack debounce state ─────────────────────────────────
+  let lastHeartAttackTriggerMs = 0;
+  const HEART_ATTACK_DEBOUNCE_MS = 30_000;
 
   // ── Epic 9: UI client registry + state broadcast ─────────────────────────
   // Sockets that send a type:"mode" message are tagged as UI clients.
@@ -477,6 +482,16 @@ export function startServer({
           console.log(`[beat] thump @ ts=${message.timestamp}`);
           if (playBeat) playBeat();
         }
+      }
+
+      if (message.type === "simulate-heart-attack") {
+        if (rxTime - lastHeartAttackTriggerMs < HEART_ATTACK_DEBOUNCE_MS) {
+          console.log(`[emergency] simulate-heart-attack debounced (${rxTime - lastHeartAttackTriggerMs}ms since last trigger)`);
+          return;
+        }
+        lastHeartAttackTriggerMs = rxTime;
+        console.log(`[emergency] simulate-heart-attack triggered — calling ${process.env.EMERGENCY_CONTACT_PHONE ?? "(not configured)"}`);
+        placeEmergencyCall({ timestamp: Date.now() });
       }
 
       if (message.type === "tip") {

@@ -78,6 +78,14 @@ JSON messages — fire-and-forget, no response expected for MVP.
 }
 ```
 
+```json
+// [ADDITION] Sent by the browser UI (audio-engine/public/) to trigger a
+// simulated heart-attack outbound call via ElevenLabs Conversational AI.
+// The destination phone number is configured server-side via
+// EMERGENCY_CONTACT_PHONE in .env — never accepted from the client.
+{ "type": "simulate-heart-attack", "timestamp": <epoch-ms> }
+```
+
 Existing `biometric` and `pencil` message shapes are unchanged.
 
 - `bpm`: smoothed beats-per-minute, plausible human range 40–180.
