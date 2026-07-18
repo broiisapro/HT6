@@ -96,18 +96,28 @@ export function bpmToPlaybackRateWithinZone(bpm, zone) {
  * connection/session.
  * @param {string} [initialZone] - Zone to start committed to.
  * @param {number} [dwellMs]
- * @returns {(bpm: number) => string} track — call once per incoming
- *   biometric message; returns the zone that should actually be active
- *   right now (already debounced — caller can compare to its last-applied
- *   zone to decide whether to call switchBed()).
+ * @returns {{
+ *   track: (bpm: number, classifyFn?: (bpm: number) => string) => string,
+ *   forceZone: (zone: string) => void,
+ * }} track — call once per incoming biometric message; returns the zone
+ *   that should actually be active right now (already debounced — caller
+ *   can compare to its last-applied zone to decide whether to call
+ *   switchBed()). `classifyFn` defaults to `classifyZone` (Match My Energy)
+ *   but can be swapped per-call to `classifyZoneCalmMeDown` /
+ *   `classifyZoneLiftMyEnergy` (see Epic 9's intention strategies below) —
+ *   the dwell/hysteresis state itself is intention-agnostic, only *which*
+ *   band table a candidate is classified against changes.
+ *   forceZone bypasses the dwell window entirely and commits immediately —
+ *   for deliberate performer actions (manual mode/intention switch), which
+ *   must apply instantly, not smoothed like noisy sensor data.
  */
 export function createZoneTracker(initialZone = "calm", dwellMs = MIN_DWELL_MS) {
   let committedZone = initialZone;
   let pendingZone = null;
   let pendingSince = null;
 
-  return function track(bpm) {
-    const candidate = classifyZone(bpm);
+  function track(bpm, classifyFn = classifyZone) {
+    const candidate = classifyFn(bpm);
 
     if (candidate === committedZone) {
       pendingZone = null;
@@ -128,5 +138,74 @@ export function createZoneTracker(initialZone = "calm", dwellMs = MIN_DWELL_MS) 
     }
 
     return committedZone;
-  };
+  }
+
+  function forceZone(zone) {
+    committedZone = zone;
+    pendingZone = null;
+    pendingSince = null;
+  }
+
+  return { track, forceZone };
 }
+
+/**
+ * ── Epic 9: Dynamic-mode "intention" strategies ─────────────────────────
+ * Dynamic mode lets the performer pick *how* bpm should drive zone, not
+ * just accept the default energy-matching curve. All three strategies
+ * reuse the same four zones, the same ZONE_BANDS-derived tempo nudge, and
+ * the same dwell/hysteresis debounce above — only the bpm->zone
+ * classification differs.
+ *
+ * - match_my_energy: classifyZone verbatim (existing Epic 3 behavior).
+ *
+ * - calm_me_down: a full reflection of bpm across the input range's
+ *   midpoint before classifying against the same ZONE_BANDS. This turns
+ *   the normally-increasing bpm->energy curve into a strictly *decreasing*
+ *   one: resting bpm lands in energised, a spiking bpm gets pulled toward
+ *   calm. That's a deliberate, literal reading of "actively working
+ *   against an elevated heart rate rather than mirroring it" — not a mild
+ *   damping, a full inversion, so the effect is unambiguous on stage.
+ *
+ * - lift_my_energy: a skewed set of band thresholds (LIFT_MY_ENERGY_BANDS)
+ *   that front-loads the energetic zones — the same 50-130 range, but
+ *   `energised` now starts at 95 instead of 110, `calm` is compressed to
+ *   50-60 instead of 50-70. bpm still increases zone energy monotonically
+ *   (same direction as match_my_energy), it just takes less bpm to get
+ *   there, i.e. biased toward energetic sooner/harder as the brief asks.
+ */
+
+/** Skewed bands for "Lift My Energy" — same range as ZONE_BANDS, thresholds pulled down so energetic zones arrive sooner. */
+export const LIFT_MY_ENERGY_BANDS = [
+  { zone: "calm", min: 50, max: 60 },
+  { zone: "focused", min: 60, max: 75 },
+  { zone: "dreamy", min: 75, max: 95 },
+  { zone: "energised", min: 95, max: 130 },
+];
+
+function classifyWithBands(bpm, bands) {
+  const clamped = clamp(bpm, INPUT_MIN_BPM, INPUT_MAX_BPM);
+  const band = bands.find((b) => clamped >= b.min && clamped <= b.max) ?? bands[0];
+  return band.zone;
+}
+
+/** "Lift My Energy": biases toward energetic zones sooner/harder than the default bands. */
+export function classifyZoneLiftMyEnergy(bpm) {
+  return classifyWithBands(bpm, LIFT_MY_ENERGY_BANDS);
+}
+
+/** "Calm Me Down": reflects bpm across the input range's midpoint, then classifies normally — inverts the energy curve so elevated heart rate steers toward calmer zones. */
+export function classifyZoneCalmMeDown(bpm) {
+  const clamped = clamp(bpm, INPUT_MIN_BPM, INPUT_MAX_BPM);
+  const reflected = INPUT_MIN_BPM + INPUT_MAX_BPM - clamped;
+  return classifyZone(reflected);
+}
+
+/** Intention name -> classifier function. Used by server.js to pick which strategy `createZoneTracker().track()` classifies against. */
+export const INTENTION_CLASSIFIERS = {
+  match_my_energy: classifyZone,
+  calm_me_down: classifyZoneCalmMeDown,
+  lift_my_energy: classifyZoneLiftMyEnergy,
+};
+
+export const DEFAULT_INTENTION = "match_my_energy";

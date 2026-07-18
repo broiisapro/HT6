@@ -17,6 +17,15 @@ JSON messages — fire-and-forget, no response expected for MVP.
 
 // Sent by pencil-input/
 { "type": "pencil", "pressure": 0.65, "x": 320.5, "y": 180.2, "velocity": 45.3, "tilt": null, "timestamp": 1737000000000 }
+
+// Sent by audio-engine/public/ (the mode-selector UI) — Epic 9, additive
+{ "type": "mode", "mode": "static", "zone": "calm", "intention": null, "timestamp": 1737000000000 }
+{ "type": "mode", "mode": "dynamic", "zone": null, "intention": "match_my_energy", "timestamp": 1737000000000 }
+
+// Broadcast BACK to UI clients only (connected via ws://<host>:8765/?client=ui),
+// on connect and whenever mode/zone/intention changes — biometrics/pencil-input
+// never receive this, they are fire-and-forget senders with no reply expected.
+{ "type": "state", "mode": "dynamic", "zone": "focused", "pinnedZone": null, "intention": "match_my_energy", "timestamp": 1737000000000 }
 ```
 
 - `bpm`: smoothed beats-per-minute, plausible human range 40–180.
@@ -25,6 +34,12 @@ JSON messages — fire-and-forget, no response expected for MVP.
 - `velocity`: pixels/second, computed from position deltas over time.
 - `tilt`: degrees if available on this iPad's WebKit version, otherwise `null` — never fabricate a value.
 - `timestamp`: epoch milliseconds, client-side capture time.
+- `mode` (in the `mode` message): `"static"` or `"dynamic"`.
+- `zone` (in the `mode` message): one of `"calm" | "focused" | "dreamy" | "energised"`, required when `mode: "static"`, otherwise `null`.
+- `intention` (in the `mode` message): one of `"calm_me_down" | "match_my_energy" | "lift_my_energy"`, required when `mode: "dynamic"`, otherwise `null`.
+- `zone` (in the `state` broadcast): the zone actually playing right now, regardless of mode.
+- `pinnedZone` (in the `state` broadcast): the zone pinned by static mode, or `null` while dynamic.
+- Manual `mode` selections apply immediately server-side (no dwell/debounce) — only bpm-driven zone changes go through the hysteresis window.
 
 ## Rules everyone follows
 
