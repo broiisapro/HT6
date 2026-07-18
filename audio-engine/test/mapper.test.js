@@ -14,6 +14,11 @@ import {
   clampBpm,
   createBpmRateLimiter,
   applyMoodInversion,
+  createStressStateMachine,
+  STRESS_STATE,
+  RISE_RATE_THRESHOLD,
+  MIN_CONSECUTIVE_SAMPLES,
+  COOLDOWN_MS,
   BED_BPM,
   INPUT_MIN_BPM,
   INPUT_MAX_BPM,
@@ -309,7 +314,62 @@ test("pencilToAudioParams: x out of bounds clamps to [-1, 1]", () => {
   assert.ok(Math.abs(right - 1) < 0.001, `got ${right}`);
 });
 
-// ── createVelocitySmoother — EMA behaviour ───────────────────────────────────
+// ── createStressStateMachine ──────────────────────────────────────────────────────
+
+test("stressMachine: steady-state BPM stays CALM", () => {
+  const sm = createStressStateMachine();
+  let now = 0;
+  // Feed 10 messages with a steady 75 BPM (no rise)
+  for (let i = 0; i < 10; i++) {
+    now += 1000;
+    sm.update(75, now);
+  }
+  assert.strictEqual(sm.getState(), STRESS_STATE.CALM, "steady signal must stay CALM");
+});
+
+test("stressMachine: scripted BPM rise sequence reaches PEAK", () => {
+  const sm = createStressStateMachine();
+  // First message: establishes baseline at 70 BPM.
+  sm.update(70, 0);
+
+  // Each subsequent message 1s later, rising at RISE_RATE_THRESHOLD + 1 BPM/sec.
+  // Should trigger RISING after MIN_CONSECUTIVE_SAMPLES, then PEAK.
+  const risePerSec = RISE_RATE_THRESHOLD + 2; // above threshold
+  let bpm = 70;
+  let reachedPeak = false;
+  for (let i = 1; i <= 10; i++) {
+    bpm += risePerSec;
+    sm.update(bpm, i * 1000);
+    if (sm.getState() === STRESS_STATE.PEAK || sm.getState() === STRESS_STATE.RELEASING) {
+      reachedPeak = true;
+      break;
+    }
+  }
+  assert.ok(reachedPeak, `Expected PEAK or RELEASING, got ${sm.getState()}`);
+});
+
+test("stressMachine: cooldown blocks immediate re-trigger after RELEASING", () => {
+  const sm = createStressStateMachine();
+  // Manually drive through to CALM via forceCalm to simulate end of release.
+  sm.update(70, 0);
+  sm.forceCalm(); // returns to CALM, sets cooldown timer
+
+  // Immediately try to trigger RISING — should be blocked by cooldown.
+  const risePerSec = RISE_RATE_THRESHOLD + 5;
+  let bpm = 70;
+  for (let i = 1; i <= MIN_CONSECUTIVE_SAMPLES + 2; i++) {
+    bpm += risePerSec;
+    sm.update(bpm, i * 1000); // within COOLDOWN_MS (3s)
+  }
+  // Cooldown is 3000ms; we only advanced 3 seconds total at 1s/step.
+  // State should still be CALM (blocked by cooldown).
+  assert.strictEqual(
+    sm.getState(), STRESS_STATE.CALM,
+    `Cooldown should block re-trigger; got ${sm.getState()}`
+  );
+});
+
+// ── createVelocitySmoother — EMA behaviour ─────────────────────────────────────────
 
 test("createVelocitySmoother: first call returns raw value (no prior state)", () => {
   const smooth = createVelocitySmoother();

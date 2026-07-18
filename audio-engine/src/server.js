@@ -3,6 +3,8 @@ import {
   clampBpm,
   createBpmRateLimiter,
   applyMoodInversion,
+  createStressStateMachine,
+  STRESS_STATE,
   BED_BPM,
   STALE_TIMEOUT_MS,
 } from "./biometric-mapper.js";
@@ -70,11 +72,15 @@ export function startServer({
   lfo = null,
   fallbackPlayer = null,
   playBeat = null,
+  applyStressIntensity = null,
 } = {}) {
   const wss = new WebSocketServer({ host: HOST, port: PORT });
 
   // ── Item 3: beat debounce state ─────────────────────────────────────────
   let lastBeatRxMs = 0;
+
+  // ── Item 4: stress-spike state machine ──────────────────────────────────
+  const stressMachine = createStressStateMachine();
 
   // ── Epic 8.5: rate limiter + mode state ─────────────────────────────────
   // Rate limiter is always active (no on/off toggle — it's a safety net).
@@ -119,6 +125,9 @@ export function startServer({
         );
         sourceNode.playbackRate.value = 1.0;
       }
+      // Item 4: stale data forces stress machine back to CALM.
+      stressMachine.forceCalm();
+      if (applyStressIntensity) applyStressIntensity(0, false);
     }, STALE_TIMEOUT_MS);
   }
 
@@ -200,6 +209,16 @@ export function startServer({
         const limited = rateLimiter(clamped, rxTime);
         const effective = oppositeMoodEnabled ? applyMoodInversion(limited) : limited;
         const rate = effective / BED_BPM;
+
+        // Item 4: stress state machine — runs on every biometric message.
+        const prevState = stressMachine.getState();
+        const intensity01 = stressMachine.update(effective, rxTime);
+        const newState    = stressMachine.getState();
+        const isPeakEntry = prevState !== STRESS_STATE.PEAK && newState === STRESS_STATE.PEAK;
+        if (applyStressIntensity) applyStressIntensity(intensity01, isPeakEntry);
+        if (newState !== prevState) {
+          console.log(`[stress] ${prevState} → ${newState} (intensity=${intensity01.toFixed(3)})`);
+        }
 
         if (sourceNode) {
           sourceNode.playbackRate.value = rate;

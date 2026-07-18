@@ -9,6 +9,13 @@ const THUMP_FREQ_HZ     = 60;   // fundamental: low sine rumble
 const THUMP_ATTACK_S    = 0.002; // 2ms attack
 const THUMP_DECAY_S     = 0.2;   // 200ms exponential decay
 
+/** Stress layer constants (Item 4 — stress-spike triggered chain). */
+const STRESS_BP_LOW_HZ  = 200;   // bandpass centre at intensity=0
+const STRESS_BP_HIGH_HZ = 4000;  // bandpass centre at intensity=1
+const STRESS_BED_DUCK   = 0.6;   // main-bed gain dip on PEAK entry
+const STRESS_DUCK_TC    = 0.04;  // setTargetAtTime TC for duck (150ms dip)
+const STRESS_RECOVER_TC = 0.3;   // setTargetAtTime TC for duck recovery
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BED_PATH = path.join(__dirname, "..", "assets", "bed.wav");
 
@@ -85,6 +92,51 @@ export async function startPlayback() {
   sourceNode.start();
   lfo.start();
 
+  // ── Item 4: Stress layer ──────────────────────────────────────────────────
+  // White noise → bandpass filter → gain node driven by intensity01.
+  // Self-contained parallel chain, no interaction with the bed chain.
+  const NOISE_BUFFER_SIZE = context.sampleRate * 2; // 2 seconds of noise
+  const noiseBuffer = context.createBuffer(1, NOISE_BUFFER_SIZE, context.sampleRate);
+  const noiseData = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < NOISE_BUFFER_SIZE; i++) noiseData[i] = Math.random() * 2 - 1;
+
+  const noiseSource = context.createBufferSource();
+  noiseSource.buffer = noiseBuffer;
+  noiseSource.loop = true;
+
+  const stressBandpass = context.createBiquadFilter();
+  stressBandpass.type = "bandpass";
+  stressBandpass.frequency.value = STRESS_BP_LOW_HZ;
+  stressBandpass.Q.value = 1.5;
+
+  const stressGain = context.createGain();
+  stressGain.gain.value = 0; // silent until triggered
+
+  noiseSource.connect(stressBandpass);
+  stressBandpass.connect(stressGain);
+  stressGain.connect(context.destination);
+  noiseSource.start();
+
+  /**
+   * Apply stress intensity to the triggered layer.
+   * Called by server.js on every biometric message.
+   * @param {number} intensity01  - 0..1, output of createStressStateMachine().update().
+   * @param {boolean} isPeakEntry - true on the first call after entering PEAK state.
+   */
+  function applyStressIntensity(intensity01, isPeakEntry = false) {
+    const now = context.currentTime;
+    // Sweep bandpass centre: STRESS_BP_LOW at 0, STRESS_BP_HIGH at 1.
+    const bpFreq = STRESS_BP_LOW_HZ * Math.pow(STRESS_BP_HIGH_HZ / STRESS_BP_LOW_HZ, intensity01);
+    stressBandpass.frequency.setTargetAtTime(bpFreq, now, 0.05);
+    stressGain.gain.setTargetAtTime(intensity01, now, 0.05);
+
+    // Optional sidechain-style bed duck on PEAK entry.
+    if (isPeakEntry) {
+      tremoloGain.gain.setTargetAtTime(STRESS_BED_DUCK, now, STRESS_DUCK_TC);
+      tremoloGain.gain.setTargetAtTime(TREMOLO_BASE_GAIN, now + 0.15, STRESS_RECOVER_TC);
+    }
+  }
+
   console.log(`[playback] looping ${BED_PATH} (${audioBuffer.duration.toFixed(1)}s bed)`);
 
   /**
@@ -113,5 +165,5 @@ export async function startPlayback() {
     osc.stop(now + THUMP_ATTACK_S + THUMP_DECAY_S * 4);
   }
 
-  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat };
+  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity };
 }

@@ -195,6 +195,173 @@ export function createBpmRateLimiter(maxBpmPerSec = MAX_BPM_CHANGE_PER_SEC) {
   };
 }
 
+// ── Item 4: Stress-spike state machine ────────────────────────────────────────
+
+/** BPM/sec rise rate required to enter RISING from CALM. */
+export const RISE_RATE_THRESHOLD = 3.0;
+
+/** Number of consecutive messages above RISE_RATE_THRESHOLD to enter RISING. */
+export const MIN_CONSECUTIVE_SAMPLES = 2;
+
+/** Milliseconds the triggered layer holds before decaying back to CALM. */
+export const RELEASE_TIME_MS = 6000;
+
+/**
+ * BPM band: if BPM returns within this many BPM of the pre-rise baseline
+ * while RELEASING, return to CALM early.
+ */
+export const RELEASE_BAND_BPM = 5.0;
+
+/** Milliseconds before the state machine can re-arm after returning to CALM. */
+export const COOLDOWN_MS = 3000;
+
+/**
+ * States for the stress-spike machine.
+ * @readonly
+ * @enum {string}
+ */
+export const STRESS_STATE = Object.freeze({
+  CALM:      "CALM",
+  RISING:    "RISING",
+  PEAK:      "PEAK",
+  RELEASING: "RELEASING",
+});
+
+/**
+ * Create a stateful stress-spike state machine.
+ *
+ * Consumes consecutive biometric messages and returns an `intensity01` float
+ * in [0, 1] representing the triggered-layer gain.  The caller drives a
+ * separate audio chain (white noise → bandpass → gain) with this value.
+ *
+ * State transitions:
+ *   CALM → RISING: dBpmDt > RISE_RATE_THRESHOLD, sustained for
+ *                   MIN_CONSECUTIVE_SAMPLES messages.
+ *   RISING → PEAK: dBpmDt falls back toward zero, OR 3s hard ceiling hit.
+ *   PEAK → RELEASING: immediately on entering PEAK, begin timed decay.
+ *   RELEASING → CALM: after RELEASE_TIME_MS, or BPM within RELEASE_BAND_BPM
+ *                      of baseline.
+ *   Any → CALM: forced by forceCalm() (stale biometric data).
+ *
+ * @returns {{ update(bpm, nowMs): number, forceCalm(): void, getState(): string }}
+ */
+export function createStressStateMachine() {
+  let state        = STRESS_STATE.CALM;
+  let lastBpm      = null;
+  let lastTs       = null;
+  let risingCount  = 0;           // consecutive above-threshold updates
+  let risingStartMs = null;       // when we first entered RISING
+  let baseline     = null;        // BPM at CALM→RISING transition
+  let peakEntryMs  = null;        // timestamp of entering PEAK
+  let calmReturnMs = null;        // timestamp of returning to CALM (for cooldown)
+  let intensity01  = 0.0;
+
+  // Attack/release time constants for intensity01 smoothing.
+  const ATTACK_TC_MS  = 200;
+  const RELEASE_TC_MS = RELEASE_TIME_MS;
+  const RISING_HARD_CEILING_MS = 3000;
+
+  function _decayIntensity(nowMs, referenceMs, tcMs) {
+    const elapsed = nowMs - referenceMs;
+    return Math.exp(-elapsed / tcMs);
+  }
+
+  /**
+   * Advance the state machine with the next BPM sample.
+   * @param {number} bpm   - Current smoothed/clamped BPM.
+   * @param {number} nowMs - Current timestamp (Date.now()).
+   * @returns {number} intensity01 in [0, 1].
+   */
+  function update(bpm, nowMs) {
+    // First message: no history, can't compute dBpmDt.
+    if (lastBpm === null || lastTs === null) {
+      lastBpm = bpm;
+      lastTs  = nowMs;
+      baseline = bpm;
+      return intensity01;
+    }
+
+    const dtSec = (nowMs - lastTs) / 1000;
+    const dBpmDt = dtSec > 0 ? (bpm - lastBpm) / dtSec : 0;
+    lastBpm = bpm;
+    lastTs  = nowMs;
+
+    switch (state) {
+      case STRESS_STATE.CALM: {
+        // Re-arm guard: cooldown after returning from RELEASING.
+        if (calmReturnMs !== null && nowMs - calmReturnMs < COOLDOWN_MS) break;
+        if (dBpmDt > RISE_RATE_THRESHOLD) {
+          risingCount++;
+          if (risingCount >= MIN_CONSECUTIVE_SAMPLES) {
+            state = STRESS_STATE.RISING;
+            risingStartMs = nowMs;
+            baseline = bpm - dBpmDt * dtSec; // approximate BPM before the rise
+          }
+        } else {
+          risingCount = 0;
+        }
+        break;
+      }
+
+      case STRESS_STATE.RISING: {
+        const risingDuration = nowMs - (risingStartMs || nowMs);
+        const hardCeilingHit = risingDuration >= RISING_HARD_CEILING_MS;
+        if (dBpmDt <= 0 || hardCeilingHit) {
+          // BPM is no longer rising, or we hit the time ceiling → fire PEAK.
+          state      = STRESS_STATE.PEAK;
+          peakEntryMs = nowMs;
+          intensity01 = 1.0; // fast attack: instant on PEAK entry
+          risingCount = 0;
+        }
+        break;
+      }
+
+      case STRESS_STATE.PEAK: {
+        // Immediately transition to RELEASING.
+        state = STRESS_STATE.RELEASING;
+        break;
+      }
+
+      case STRESS_STATE.RELEASING: {
+        // Exponential decay of intensity01.
+        intensity01 = peakEntryMs !== null
+          ? _decayIntensity(nowMs, peakEntryMs, RELEASE_TC_MS)
+          : 0;
+
+        const elapsed = peakEntryMs !== null ? nowMs - peakEntryMs : Infinity;
+        const bpmNearBaseline = baseline !== null && Math.abs(bpm - baseline) <= RELEASE_BAND_BPM;
+        if (elapsed >= RELEASE_TIME_MS || bpmNearBaseline) {
+          state        = STRESS_STATE.CALM;
+          intensity01  = 0;
+          calmReturnMs = nowMs;
+          risingCount  = 0;
+        }
+        break;
+      }
+    }
+
+    return intensity01;
+  }
+
+  /**
+   * Force state machine back to CALM (used by stale-data timeout).
+   * Always resets history and arms the cooldown, regardless of current state,
+   * so callers don't need to check state before calling.
+   */
+  function forceCalm() {
+    state        = STRESS_STATE.CALM;
+    intensity01  = 0;
+    calmReturnMs = Date.now();
+    risingCount  = 0;
+    lastBpm      = null;
+    lastTs       = null;
+  }
+
+  function getState() { return state; }
+
+  return { update, forceCalm, getState };
+}
+
 /**
  * Invert the BPM position within [INPUT_MIN_BPM, INPUT_MAX_BPM].
  *
