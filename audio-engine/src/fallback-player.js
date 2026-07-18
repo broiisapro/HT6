@@ -62,16 +62,18 @@ const pencilMessages = JSON.parse(
 export class FallbackPlayer {
   /**
    * @param {object} nodes
-   * @param {AudioBufferSourceNode|null} nodes.sourceNode
+   * @param {((rate: number) => void)|null} nodes.setPlaybackRate
+   *   Epic 9: replaces the old `sourceNode` param. Call with a playbackRate
+   *   value to update all active stem source nodes simultaneously.
    * @param {BiquadFilterNode|null}      nodes.filterNode
    * @param {StereoPannerNode|null}      nodes.pannerNode
    * @param {OscillatorNode|null}        nodes.lfo
    *
-   * Any node passed as null → that audio parameter is still not touched,
+   * Any parameter passed as null → that audio parameter is still not touched,
    * matching the degraded-mode contract in server.js.
    */
-  constructor({ sourceNode = null, filterNode = null, pannerNode = null, lfo = null } = {}) {
-    this._sourceNode = sourceNode;
+  constructor({ setPlaybackRate = null, filterNode = null, pannerNode = null, lfo = null } = {}) {
+    this._setPlaybackRate = setPlaybackRate;
     this._filterNode = filterNode;
     this._pannerNode = pannerNode;
     this._lfo = lfo;
@@ -153,9 +155,9 @@ export class FallbackPlayer {
   }
 
   _applyBio(bpm) {
-    if (!this._sourceNode) return;
+    if (!this._setPlaybackRate) return;
     const rate = bpmToPlaybackRate(bpm);
-    this._sourceNode.playbackRate.value = rate;
+    this._setPlaybackRate(rate);
     console.log(
       `[fallback/tempo] bpm=${bpm.toFixed(1)} → playbackRate=${rate.toFixed(4)}`
     );
