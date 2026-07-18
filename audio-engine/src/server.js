@@ -1,5 +1,9 @@
 import { WebSocketServer } from "ws";
-import { bpmToPlaybackRate, STALE_TIMEOUT_MS } from "./biometric-mapper.js";
+import {
+  bpmToPlaybackRate,
+  createBpmRateLimiter,
+  STALE_TIMEOUT_MS,
+} from "./biometric-mapper.js";
 import {
   pencilToAudioParams,
   createVelocitySmoother,
@@ -8,6 +12,7 @@ import {
   DEFAULT_PAN,
   STALE_TIMEOUT_MS as PENCIL_STALE_TIMEOUT_MS,
 } from "./pencil-mapper.js";
+import { MOOD_INVERSE } from "./mood-classifier.js";
 
 const HOST = "0.0.0.0";
 const PORT = 8765;
@@ -34,22 +39,39 @@ const PORT = 8765;
  *     playback output is not overwritten.
  *
  * @param {object} [opts]
- * @param {AudioBufferSourceNode|null} [opts.sourceNode] - The looping bed source.
+ * @param {((rate: number) => void)|null} [opts.setPlaybackRate]
+ *   Epic 9: function that updates playbackRate on all active stem source nodes.
+ * @param {((mood: string, dur?: number) => void)|null} [opts.crossfadeTo]
+ *   Epic 9: function that crossfades to a named mood stem.
+ * @param {import('./mood-classifier.js').MoodClassifier|null} [opts.classifier]
+ *   Epic 9: stateful mood classifier (feeds on rate-limited BPM + pencil velocity).
  * @param {BiquadFilterNode|null} [opts.filterNode] - Epic 6 brightness filter.
  * @param {StereoPannerNode|null} [opts.pannerNode] - Epic 6 stereo pan.
  * @param {OscillatorNode|null} [opts.lfo] - Epic 6 tremolo-rate oscillator.
  * @param {import('./fallback-player.js').FallbackPlayer|null} [opts.fallbackPlayer]
- *   All four audio nodes are returned by startPlayback(). Any omitted/null
- *   node means its corresponding messages are still logged but not applied
- *   (safe degraded mode) — lets the server run standalone for testing.
+ * @param {{ staticMode: boolean, oppositeMood: boolean }} [opts.liveState]
+ *   Epic 8.5: mutable state object toggled by keypress in index.js.
+ *   staticMode: freeze ALL parameters (tempo + melody + classification).
+ *   oppositeMood: invert mood selection (CALM↔TENSE, ENERGETIC unchanged).
+ *   Any omitted/null node means its corresponding messages are still logged but
+ *   not applied (safe degraded mode) — lets the server run standalone for testing.
  */
 export function startServer({
-  sourceNode = null,
-  filterNode = null,
-  pannerNode = null,
-  lfo = null,
-  fallbackPlayer = null,
+  setPlaybackRate = null,
+  crossfadeTo     = null,
+  classifier      = null,
+  filterNode      = null,
+  pannerNode      = null,
+  lfo             = null,
+  fallbackPlayer  = null,
+  liveState       = null,
 } = {}) {
+  // Rate limiter (Epic 8.5): caps BPM change at MAX_BPM_PER_SEC per second
+  // so sudden spikes ramp gracefully rather than lurching the tempo.
+  const rateLimitBpm = createBpmRateLimiter();
+
+  // Last smoothed pencil velocity — fed into classifier as a secondary signal.
+  let lastPencilVelocity = 0;
   const wss = new WebSocketServer({ host: HOST, port: PORT });
 
   // ── No-data fallback timer ───────────────────────────────────────────────
@@ -134,31 +156,50 @@ export function startServer({
           console.warn("[tempo] biometric message missing numeric bpm field — ignored");
           return;
         }
-        if (sourceNode) {
-          const rate = bpmToPlaybackRate(message.bpm);
-          sourceNode.playbackRate.value = rate;
+
+        // Epic 8.5: rate-limit the incoming BPM before mapping or classifying.
+        const rateLimited = rateLimitBpm(message.bpm);
+
+        // Epic 8.5 — static mode: freeze all parameter changes.
+        if (liveState?.staticMode) {
+          console.log(`[tempo] STATIC MODE — biometric ignored (heart=${message.bpm.toFixed(1)} BPM)`);
+          resetStaleTimer();
+          return;
+        }
+
+        if (setPlaybackRate) {
+          const rate = bpmToPlaybackRate(rateLimited);
+          setPlaybackRate(rate);
           const applyTime = Date.now();
-          // Log latency fields:
-          //   transit_latency = rxTime - message.timestamp
-          //     The round-trip from the biometrics pipeline's Date.now() at
-          //     emit time to the server's Date.now() at message receipt.
-          //     Both processes are on the same Mac; this measures WebSocket
-          //     framing + loopback TCP + Node event-loop scheduling overhead.
-          //   apply_latency = applyTime - rxTime
-          //     Internal parse + mapping time only (sub-ms in practice).
           const transitLatency = typeof message.timestamp === "number"
             ? rxTime - message.timestamp
             : null;
           console.log(
             `[tempo] heart=${message.bpm.toFixed(1)} BPM` +
-            ` → playbackRate=${rate.toFixed(4)}` +
+            ` → rateLimited=${rateLimited.toFixed(1)} BPM → playbackRate=${rate.toFixed(4)}` +
             ` | transit_latency=${transitLatency !== null ? transitLatency + "ms" : "n/a"}` +
             ` | apply_latency=${applyTime - rxTime}ms` +
             ` | msg_ts=${message.timestamp}`
           );
         } else {
-          console.log(`[tempo] biometric received but no sourceNode — heart=${message.bpm} BPM (no-op)`);
+          console.log(`[tempo] biometric received but no setPlaybackRate — heart=${message.bpm} BPM (no-op)`);
         }
+
+        // Epic 9: run the classifier and crossfade if mood changed.
+        if (classifier && crossfadeTo) {
+          const newMood = classifier.feed(rateLimited, lastPencilVelocity);
+          if (newMood) {
+            // Epic 8.5 opposite-mood: invert selection (CALM↔TENSE, ENERGETIC unchanged).
+            const stem = liveState?.oppositeMood ? MOOD_INVERSE[newMood] : newMood;
+            console.log(
+              `[mood] classified=${newMood}` +
+              `${liveState?.oppositeMood ? ` → inverted=${stem}` : ""}` +
+              ` | bpm=${rateLimited.toFixed(1)} vel=${lastPencilVelocity.toFixed(0)}px/s`
+            );
+            crossfadeTo(stem);
+          }
+        }
+
         resetStaleTimer();
       }
 
@@ -173,6 +214,16 @@ export function startServer({
         }
 
         const velocity = smoothVelocity(message.velocity);
+        // Epic 9: store the latest smoothed velocity for the classifier.
+        lastPencilVelocity = velocity;
+
+        // Epic 8.5 — static mode: freeze melody parameters too.
+        if (liveState?.staticMode) {
+          console.log(`[melody] STATIC MODE — pencil ignored`);
+          resetPencilStaleTimer();
+          return;
+        }
+
         const { cutoffHz, tremoloHz, pan } = pencilToAudioParams({
           x: message.x,
           velocity,
