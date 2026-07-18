@@ -57,14 +57,15 @@ const PORT = 8765;
  *   not applied (safe degraded mode) — lets the server run standalone for testing.
  */
 export function startServer({
-  setPlaybackRate = null,
-  crossfadeTo     = null,
-  classifier      = null,
-  filterNode      = null,
-  pannerNode      = null,
-  lfo             = null,
-  fallbackPlayer  = null,
-  liveState       = null,
+  setPlaybackRate  = null,
+  crossfadeTo      = null,
+  classifier       = null,
+  filterNode       = null,
+  pannerNode       = null,
+  lfo              = null,
+  fallbackPlayer   = null,
+  liveState        = null,
+  sessionTracker   = null,   // Epic 9.5: optional, records session stats for portrait
 } = {}) {
   // Rate limiter (Epic 8.5): caps BPM change at MAX_BPM_PER_SEC per second
   // so sudden spikes ramp gracefully rather than lurching the tempo.
@@ -185,18 +186,32 @@ export function startServer({
           console.log(`[tempo] biometric received but no setPlaybackRate — heart=${message.bpm} BPM (no-op)`);
         }
 
+        // Epic 9.5: record BPM in session tracker (after rate-limiting).
+        sessionTracker?.recordBpm(rateLimited);
+
         // Epic 9: run the classifier and crossfade if mood changed.
         if (classifier && crossfadeTo) {
           const newMood = classifier.feed(rateLimited, lastPencilVelocity);
           if (newMood) {
-            // Epic 8.5 opposite-mood: invert selection (CALM↔TENSE, ENERGETIC unchanged).
-            const stem = liveState?.oppositeMood ? MOOD_INVERSE[newMood] : newMood;
-            console.log(
-              `[mood] classified=${newMood}` +
-              `${liveState?.oppositeMood ? ` → inverted=${stem}` : ""}` +
-              ` | bpm=${rateLimited.toFixed(1)} vel=${lastPencilVelocity.toFixed(0)}px/s`
-            );
-            crossfadeTo(stem);
+            // Epic 9.5: record the mood change in the session tracker.
+            sessionTracker?.recordMood(newMood);
+
+            // Epic 9.5 panic mode: classifier still advances for tracking,
+            // but crossfade is suppressed while panic overrides the stem.
+            if (!liveState?.panicMode) {
+              // Epic 8.5 opposite-mood: invert selection (CALM↔TENSE, ENERGETIC unchanged).
+              const stem = liveState?.oppositeMood ? MOOD_INVERSE[newMood] : newMood;
+              console.log(
+                `[mood] classified=${newMood}` +
+                `${liveState?.oppositeMood ? ` → inverted=${stem}` : ""}` +
+                ` | bpm=${rateLimited.toFixed(1)} vel=${lastPencilVelocity.toFixed(0)}px/s`
+              );
+              crossfadeTo(stem);
+            } else {
+              console.log(
+                `[mood] PANIC MODE — classifier advanced to ${newMood} but crossfade suppressed`
+              );
+            }
           }
         }
 
@@ -216,6 +231,8 @@ export function startServer({
         const velocity = smoothVelocity(message.velocity);
         // Epic 9: store the latest smoothed velocity for the classifier.
         lastPencilVelocity = velocity;
+        // Epic 9.5: record pencil activity for session portrait.
+        sessionTracker?.recordPencil(velocity);
 
         // Epic 8.5 — static mode: freeze melody parameters too.
         if (liveState?.staticMode) {

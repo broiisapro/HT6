@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 960" width="1280" height="960">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="70%">
+      <stop offset="0%"   stop-color="#0a0a1a"/>
+      <stop offset="100%" stop-color="#000008"/>
+    </radialGradient>
+    <radialGradient id="g1" cx="30%" cy="40%" r="50%">
+      <stop offset="0%"   stop-color="#1a3a6a" stop-opacity="0.7"/>
+      <stop offset="100%" stop-color="#1a3a6a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="g2" cx="70%" cy="60%" r="50%">
+      <stop offset="0%"   stop-color="#0d4a3a" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#0d4a3a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="g3" cx="50%" cy="50%" r="30%">
+      <stop offset="0%"   stop-color="#5a1a3a" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#5a1a3a" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="960" fill="url(#bg)"/>
+  <rect width="1280" height="960" fill="url(#g1)"/>
+  <rect width="1280" height="960" fill="url(#g2)"/>
+  <rect width="1280" height="960" fill="url(#g3)"/>
+
+  <!-- Abstract biometric wave lines -->
+  <g opacity="0.4" filter="url(#glow)">
+    <path d="M 0 480 Q 160 380 320 480 Q 480 580 640 420 Q 800 260 960 440 Q 1120 620 1280 480"
+          fill="none" stroke="#4488cc" stroke-width="2.5"/>
+    <path d="M 0 500 Q 160 400 320 500 Q 480 600 640 440 Q 800 280 960 460 Q 1120 640 1280 500"
+          fill="none" stroke="#4488cc" stroke-width="1.5" opacity="0.5"/>
+    <path d="M 0 460 Q 160 360 320 460 Q 480 560 640 400 Q 800 240 960 420 Q 1120 600 1280 460"
+          fill="none" stroke="#6699dd" stroke-width="1" opacity="0.3"/>
+  </g>
+
+  <!-- Pulsing concentric rings — heartbeat abstraction -->
+  <g transform="translate(640,480)" opacity="0.35">
+    <circle r="80"  fill="none" stroke="#3366bb" stroke-width="1.5"/>
+    <circle r="140" fill="none" stroke="#2255aa" stroke-width="1"/>
+    <circle r="210" fill="none" stroke="#1a4499" stroke-width="0.75"/>
+    <circle r="290" fill="none" stroke="#133388" stroke-width="0.5"/>
+  </g>
+
+  <!-- Pencil stroke traces -->
+  <g opacity="0.25" fill="none">
+    <path d="M 200 300 Q 280 250 360 320 Q 440 390 520 340 Q 600 290 680 360"
+          stroke="#44ccaa" stroke-width="3" stroke-linecap="round"/>
+    <path d="M 680 360 Q 760 430 840 380 Q 920 330 1000 400 Q 1080 470 1100 430"
+          stroke="#66ddbb" stroke-width="2" stroke-linecap="round"/>
+    <path d="M 300 600 Q 400 540 500 580 Q 600 620 700 570 Q 800 520 900 560"
+          stroke="#88aacc" stroke-width="2.5" stroke-linecap="round"/>
+  </g>
+
+  <!-- Central text -->
+  <g text-anchor="middle" font-family="-apple-system, system-ui, sans-serif" filter="url(#glow)">
+    <text x="640" y="400" font-size="22" fill="#6688aa" letter-spacing="6" font-weight="300">
+      HUMAN MIDI
+    </text>
+    <text x="640" y="460" font-size="48" fill="#99bbdd" font-weight="200" letter-spacing="2">
+      Performance Portrait
+    </text>
+    <text x="640" y="520" font-size="18" fill="#557799" letter-spacing="4" font-weight="300">
+      generating with fal.ai…
+    </text>
+    <text x="640" y="600" font-size="14" fill="#334455" letter-spacing="2">
+      press r to trigger · portrait-latest.png when complete
+    </text>
+  </g>
+
+  <!-- Corner BPM indicators -->
+  <text x="40" y="80"  font-family="monospace" font-size="13" fill="#335577" opacity="0.6">♥ BPM range</text>
+  <text x="40" y="100" font-family="monospace" font-size="13" fill="#335577" opacity="0.6">mood · calm / energetic / tense</text>
+  <text x="40" y="120" font-family="monospace" font-size="13" fill="#335577" opacity="0.6">pencil strokes · velocity</text>
+</svg>
