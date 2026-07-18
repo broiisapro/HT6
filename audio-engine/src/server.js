@@ -67,14 +67,62 @@ export function startServer({ playback = null } = {}) {
     }, PENCIL_STALE_TIMEOUT_MS);
   }
 
+  // ── No-data fallback timer ───────────────────────────────────────────────
+  // If no biometric message arrives within STALE_TIMEOUT_MS, revert the bed
+  // to its native playbackRate = 1.0 (96 BPM) so music keeps playing at a
+  // sensible default even when biometrics/ is not running.
+  let staleTimer = null;
+
+  function resetStaleTimer() {
+    if (staleTimer) clearTimeout(staleTimer);
+    staleTimer = setTimeout(() => {
+      // Epic 8: suppress revert while fallback is replaying biometric data.
+      if (fallbackPlayer?.active) return;
+      if (sourceNode) {
+        console.log(
+          `[tempo] no biometric for ${STALE_TIMEOUT_MS}ms — reverting to default playbackRate=1.0 (96 BPM)`
+        );
+        sourceNode.playbackRate.value = 1.0;
+      }
+    }, STALE_TIMEOUT_MS);
+  }
+
+  // ── Epic 6: pencil no-data fallback timer ────────────────────────────────
+  // Shorter than the biometric timer (see pencil-mapper.js STALE_TIMEOUT_MS
+  // doc comment) — pencil streams far more frequently while actively drawing,
+  // so a multi-second gap reliably means the performer lifted the Pencil.
+  let pencilStaleTimer = null;
+
+  function resetPencilStaleTimer() {
+    if (pencilStaleTimer) clearTimeout(pencilStaleTimer);
+    pencilStaleTimer = setTimeout(() => {
+      // Epic 8: suppress revert while fallback is replaying pencil data.
+      if (fallbackPlayer?.active) return;
+      console.log(
+        `[melody] no pencil for ${PENCIL_STALE_TIMEOUT_MS}ms — reverting to default filter/tremolo/pan`
+      );
+      if (filterNode) filterNode.frequency.setTargetAtTime(DEFAULT_CUTOFF_HZ, filterNode.context.currentTime, 0.05);
+      if (lfo) lfo.frequency.setTargetAtTime(DEFAULT_TREMOLO_HZ, lfo.context.currentTime, 0.05);
+      if (pannerNode) pannerNode.pan.setTargetAtTime(DEFAULT_PAN, pannerNode.context.currentTime, 0.05);
+    }, PENCIL_STALE_TIMEOUT_MS);
+  }
+
   wss.on("listening", () => {
     console.log(`[server] contract WebSocket server listening on ws://${HOST}:${PORT}`);
+    // Arm the stale timers immediately: if biometrics/ or pencil-input/ never
+    // start, we fall back to defaults after their respective timeouts rather
+    // than leaving whatever last value was set.
     resetStaleTimer();
     resetPencilStaleTimer();
   });
 
   wss.on("connection", (socket, req) => {
     const remote = req.socket.remoteAddress;
+    // Epic 7 (integration fix): smoother is per-connection, not global. A shared
+    // EMA carries stale velocity state across reconnects, so the first strokes of a
+    // new drawing session blend with the previous session's final velocity —
+    // producing incorrect tremolo values. Fresh instance per connection avoids this.
+    const smoothVelocity = createVelocitySmoother();
     console.log(`[server] client connected from ${remote}`);
 
     socket.on("message", (raw) => {
@@ -84,6 +132,13 @@ export function startServer({ playback = null } = {}) {
         message = JSON.parse(raw.toString());
       } catch (err) {
         console.warn(`[server] received non-JSON message from ${remote}: ${raw}`);
+        return;
+      }
+
+      // Epic 8: while fallback is active, log but do not apply live messages
+      // so fallback and live inputs don't fight over the same AudioParams.
+      if (fallbackPlayer?.active) {
+        console.log(`[server] fallback active — live message dropped from ${remote}:`, message);
         return;
       }
 
@@ -109,6 +164,26 @@ export function startServer({ playback = null } = {}) {
           console.log(
             `[tempo] heart=${message.bpm.toFixed(1)} BPM` +
             ` → zone=${zone} rate=${rate.toFixed(4)}` +
+        // Epic 8.5: rate-limit the incoming BPM before mapping or classifying.
+        const rateLimited = rateLimitBpm(message.bpm);
+
+        // Epic 8.5 — static mode: freeze all parameter changes.
+        if (liveState?.staticMode) {
+          console.log(`[tempo] STATIC MODE — biometric ignored (heart=${message.bpm.toFixed(1)} BPM)`);
+          resetStaleTimer();
+          return;
+        }
+
+        if (setPlaybackRate) {
+          const rate = bpmToPlaybackRate(rateLimited);
+          setPlaybackRate(rate);
+          const applyTime = Date.now();
+          const transitLatency = typeof message.timestamp === "number"
+            ? rxTime - message.timestamp
+            : null;
+          console.log(
+            `[tempo] heart=${message.bpm.toFixed(1)} BPM` +
+            ` → rateLimited=${rateLimited.toFixed(1)} BPM → playbackRate=${rate.toFixed(4)}` +
             ` | transit_latency=${transitLatency !== null ? transitLatency + "ms" : "n/a"}` +
             ` | apply_latency=${applyTime - rxTime}ms` +
             ` | msg_ts=${message.timestamp}`
@@ -116,6 +191,38 @@ export function startServer({ playback = null } = {}) {
         } else {
           console.log(`[tempo] biometric received but no playback handle — heart=${message.bpm} BPM (no-op)`);
         }
+          console.log(`[tempo] biometric received but no setPlaybackRate — heart=${message.bpm} BPM (no-op)`);
+        }
+
+        // Epic 9.5: record BPM in session tracker (after rate-limiting).
+        sessionTracker?.recordBpm(rateLimited);
+
+        // Epic 9: run the classifier and crossfade if mood changed.
+        if (classifier && crossfadeTo) {
+          const newMood = classifier.feed(rateLimited, lastPencilVelocity);
+          if (newMood) {
+            // Epic 9.5: record the mood change in the session tracker.
+            sessionTracker?.recordMood(newMood);
+
+            // Epic 9.5 panic mode: classifier still advances for tracking,
+            // but crossfade is suppressed while panic overrides the stem.
+            if (!liveState?.panicMode) {
+              // Epic 8.5 opposite-mood: invert selection (CALM↔TENSE, ENERGETIC unchanged).
+              const stem = liveState?.oppositeMood ? MOOD_INVERSE[newMood] : newMood;
+              console.log(
+                `[mood] classified=${newMood}` +
+                `${liveState?.oppositeMood ? ` → inverted=${stem}` : ""}` +
+                ` | bpm=${rateLimited.toFixed(1)} vel=${lastPencilVelocity.toFixed(0)}px/s`
+              );
+              crossfadeTo(stem);
+            } else {
+              console.log(
+                `[mood] PANIC MODE — classifier advanced to ${newMood} but crossfade suppressed`
+              );
+            }
+          }
+        }
+
         resetStaleTimer();
       }
 
@@ -130,6 +237,18 @@ export function startServer({ playback = null } = {}) {
         }
 
         const velocity = smoothVelocity(message.velocity);
+        // Epic 9: store the latest smoothed velocity for the classifier.
+        lastPencilVelocity = velocity;
+        // Epic 9.5: record pencil activity for session portrait.
+        sessionTracker?.recordPencil(velocity);
+
+        // Epic 8.5 — static mode: freeze melody parameters too.
+        if (liveState?.staticMode) {
+          console.log(`[melody] STATIC MODE — pencil ignored`);
+          resetPencilStaleTimer();
+          return;
+        }
+
         const { cutoffHz, tremoloHz, pan } = pencilToAudioParams({
           x: message.x,
           velocity,
@@ -140,6 +259,17 @@ export function startServer({ playback = null } = {}) {
           playback.setMelodyParams({ cutoffHz, tremoloHz, pan });
           const applyTime = Date.now();
           const transitLatency = typeof message.timestamp === "number" ? rxTime - message.timestamp : null;
+        if (filterNode || pannerNode || lfo) {
+          // setTargetAtTime (not a direct .value assignment) avoids audible
+          // zipper noise from instantaneous AudioParam jumps at ~30 msg/s.
+          const now = (filterNode || pannerNode || lfo).context.currentTime;
+          if (filterNode) filterNode.frequency.setTargetAtTime(cutoffHz, now, 0.05);
+          if (pannerNode) pannerNode.pan.setTargetAtTime(pan, now, 0.05);
+          if (lfo) lfo.frequency.setTargetAtTime(tremoloHz, now, 0.05);
+          const applyTime = Date.now();
+          const transitLatency = typeof message.timestamp === "number"
+            ? rxTime - message.timestamp
+            : null;
           console.log(
             `[melody] tilt=${message.tilt === null ? "null" : message.tilt.toFixed(1)}` +
             ` velocity=${velocity.toFixed(0)}px/s x=${message.x.toFixed(0)}` +
@@ -149,6 +279,7 @@ export function startServer({ playback = null } = {}) {
           );
         } else {
           console.log(`[melody] pencil received but no playback handle — (no-op)`);
+          console.log(`[melody] pencil received but no audio nodes — (no-op)`);
         }
         resetPencilStaleTimer();
       }

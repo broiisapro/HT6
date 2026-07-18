@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Human MIDI — Pencil Input</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; box-sizing: border-box; -webkit-user-select: none; user-select: none; }
+  html, body { height: 100%; background: #111; color: #eee; font: 14px/1.4 -apple-system, system-ui, sans-serif; }
+  #wrap { display: flex; height: 100%; }
+  #stage { position: relative; flex: 1; touch-action: none; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; background: #181818; }
+  #hud { width: 260px; padding: 16px; background: #1c1c1c; border-left: 1px solid #333; overflow-y: auto; }
+  #hud h1 { font-size: 15px; margin-bottom: 10px; }
+  #hud .row { display: flex; justify-content: space-between; padding: 3px 0; font-variant-numeric: tabular-nums; }
+  #hud .row span:last-child { color: #6cf; }
+  #hint { position: absolute; top: 12px; left: 12px; color: #666; pointer-events: none; }
+  .tilt-yes { color: #6f6 !important; } .tilt-no { color: #f66 !important; }
+  button { margin-top: 12px; width: 100%; padding: 8px; background: #333; color: #eee; border: 1px solid #555; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="c"></canvas>
+    <div id="hint">Draw with the Apple Pencil. Line thickness follows tilt (USB-C Pencil has no pressure).</div>
+  </div>
+  <div id="hud">
+    <h1>Pencil Capture</h1>
+    <div class="row"><span>pointerType</span><span id="v-type">–</span></div>
+    <div class="row"><span>pressure (const, no HW)</span><span id="v-pressure">–</span></div>
+    <div class="row"><span>x</span><span id="v-x">–</span></div>
+    <div class="row"><span>y</span><span id="v-y">–</span></div>
+    <div class="row"><span>velocity px/s</span><span id="v-vel">–</span></div>
+    <div class="row"><span>tilt (deg)</span><span id="v-tilt">–</span></div>
+    <hr style="border-color:#333;margin:12px 0">
+    <div class="row"><span>Touch.force (pressure)</span><span id="p-tforce">?</span></div>
+    <div class="row"><span>Touch.altitudeAngle</span><span id="p-talt">?</span></div>
+    <div class="row"><span>Touch.azimuthAngle</span><span id="p-tilt">?</span></div>
+    <div class="row" style="display:none"><span id="p-alt"></span></div>
+    <hr style="border-color:#333;margin:12px 0">
+    <div style="font-size:12px;margin-bottom:6px;color:#aaa;font-weight:600">WebSocket</div>
+    <input id="ws-url" type="text" placeholder="ws://192.168.x.x:8765"
+      style="width:100%;padding:4px 6px;background:#222;color:#eee;border:1px solid #444;border-radius:4px;font-size:12px;margin-bottom:6px;outline:none">
+    <div style="display:flex;gap:6px;margin-bottom:6px">
+      <button id="ws-connect-btn" style="flex:1;margin:0">Connect</button>
+      <button id="ws-disconnect-btn" style="flex:1;margin:0">Disconnect</button>
+    </div>
+    <div class="row"><span>ws status</span><span id="ws-status" style="color:#aaa">idle</span></div>
+    <div class="row"><span>msgs sent</span><span id="ws-sent">0</span></div>
+    <button id="clear">Clear canvas</button>
+  </div>
+</div>
+<script>
+// --- pure logic: velocity from two samples (px/s). Guards divide-by-zero. ---
+function velocity(x0, y0, t0, x1, y1, t1) {
+  const dt = (t1 - t0) / 1000;          // ms -> s
+  if (dt <= 0) return 0;
+  return Math.hypot(x1 - x0, y1 - y0) / dt;
+}
+// self-check (logs to console; fails loudly if the math breaks)
+console.assert(velocity(0, 0, 0, 30, 40, 100) === 500, "velocity: 50px in 0.1s = 500px/s");
+console.assert(velocity(0, 0, 5, 9, 9, 5) === 0, "velocity: zero dt -> 0, no NaN/Infinity");
+
+const $ = id => document.getElementById(id);
+const canvas = $("c"), ctx = canvas.getContext("2d");
+function resize() {
+  const r = canvas.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  canvas.width = r.width * dpr; canvas.height = r.height * dpr;
+  ctx.scale(dpr, dpr); ctx.lineCap = "round"; ctx.lineJoin = "round";
+}
+addEventListener("resize", resize); resize();
+
+let last = null;        // {x,y,t}
+let velEMA = 0;         // smoothed velocity for a readable readout
+const RATE_MS = 1000 / 60;
+
+function draw(x, y, pressure) {
+  if (!last) return;
+  const p = Math.max(0, Math.min(1, pressure));   // clamp for visuals only
+  ctx.strokeStyle = `hsl(${200 + p * 120}, 90%, ${40 + p * 40}%)`;
+  ctx.lineWidth = 1 + p * 24;                      // pressure -> thickness
+  ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(x, y); ctx.stroke();
+}
+
+// One HUD update from a normalized sample, whatever the source (pen or mouse).
+function emit(s) {   // s = { x, y, t, pressure, type, tiltDeg|null }
+  let vel = 0;
+  if (last) vel = velocity(last.x, last.y, last.t, s.x, s.y, s.t);
+  velEMA = velEMA * 0.8 + vel * 0.2;
+  // Pressure is dead on the USB-C Pencil (no force sensor), so drive the visual off
+  // tilt when available, else velocity — both are live signals on this hardware.
+  const expr = s.tiltDeg != null ? Math.min(1, s.tiltDeg / 90) : Math.min(1, velEMA / 1500);
+  draw(s.x, s.y, expr);
+  last = { x: s.x, y: s.y, t: s.t };
+  $("v-type").textContent = s.type;
+  $("v-pressure").textContent = s.pressure.toFixed(3);
+  $("v-x").textContent = s.x.toFixed(1);
+  $("v-y").textContent = s.y.toFixed(1);
+  $("v-vel").textContent = velEMA.toFixed(0);
+  $("v-tilt").textContent = s.tiltDeg == null ? "null" : s.tiltDeg.toFixed(1);
+  // Epic 5: forward to audio-engine — 30/s gate is inside wsSendPencil.
+  wsSendPencil({
+    type: "pencil",
+    pressure: s.pressure,
+    x: +s.x.toFixed(1),
+    y: +s.y.toFixed(1),
+    velocity: +vel.toFixed(1),
+    tilt: s.tiltDeg != null ? +s.tiltDeg.toFixed(2) : null,
+    timestamp: Date.now()
+  });
+}
+
+// --- PRIMARY (iPad): Touch events. Touch.force is the reliable Pencil pressure;
+//     PointerEvent.pressure is stuck at a constant on Safria, so we do NOT use it. ---
+function touchSample(t, ts) {
+  const alt = ("altitudeAngle" in t && t.altitudeAngle != null)
+    ? 90 - t.altitudeAngle * 180 / Math.PI   // altitude(rad) -> tilt-from-vertical(deg)
+    : null;
+  return { x: t.clientX, y: t.clientY, t: ts,
+           pressure: "force" in t ? t.force : 0, type: "pen/touch", tiltDeg: alt };
+}
+let lastEmitT = 0;
+canvas.addEventListener("touchstart", e => {
+  e.preventDefault(); probeTouch(e.touches[0]); last = null; emit(touchSample(e.touches[0], e.timeStamp));
+}, { passive: false });
+canvas.addEventListener("touchmove", e => {
+  e.preventDefault();
+  if (e.timeStamp - lastEmitT < RATE_MS) return;   // throttle ~60Hz (Epic 5 caps outbound at 30/s)
+  lastEmitT = e.timeStamp; emit(touchSample(e.touches[0], e.timeStamp));
+}, { passive: false });
+const stopT = () => { last = null; };
+canvas.addEventListener("touchend", stopT);
+canvas.addEventListener("touchcancel", stopT);
+
+// --- MOCK (desktop only): mouse via Pointer Events, so the page is testable with no iPad. ---
+let drawingM = false, lastEmitM = 0;
+canvas.addEventListener("pointerdown", e => {
+  if (e.pointerType !== "mouse") return;   // pen/touch go through the Touch path above
+  drawingM = true; last = null; emit({ x: e.clientX, y: e.clientY, t: e.timeStamp, pressure: 0.5, type: "mouse", tiltDeg: null });
+});
+canvas.addEventListener("pointermove", e => {
+  if (!drawingM || e.pointerType !== "mouse") return;
+  if (e.timeStamp - lastEmitM < RATE_MS) return;
+  lastEmitM = e.timeStamp; emit({ x: e.clientX, y: e.clientY, t: e.timeStamp, pressure: 0.5, type: "mouse", tiltDeg: null });
+});
+const stopM = () => { drawingM = false; last = null; };
+canvas.addEventListener("pointerup", stopM);
+canvas.addEventListener("pointerleave", stopM);
+
+$("clear").onclick = () => ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+// ============================================================
+// Epic 5 — WebSocket client (pencil → audio-engine @ :8765)
+// ============================================================
+let ws = null;
+let wsOpen = false;
+let wsLastSendT = 0;
+let wsSentCount = 0;
+const WS_INTERVAL_MS = 1000 / 30;   // cap at 30 msg/s
+
+function wsSetStatus(text, color) {
+  const el = $("ws-status");
+  el.textContent = text;
+  el.style.color = color || "#aaa";
+}
+
+function wsConnect(url) {
+  if (!url) { wsSetStatus("no URL", "#f66"); return; }
+  // Clean up any existing socket without firing our own handlers during close.
+  if (ws) {
+    ws.onopen = ws.onerror = ws.onclose = ws.onmessage = null;
+    try { ws.close(); } catch (_) {}
+    ws = null;
+  }
+  wsOpen = false;
+  wsSetStatus("connecting…", "#aaa");
+  try {
+    ws = new WebSocket(url);
+  } catch (err) {
+    wsSetStatus("bad URL", "#f66"); ws = null; return;
+  }
+  ws.onopen  = () => { wsOpen = true;  wsSetStatus("connected", "#6f6"); };
+  ws.onerror = () => { wsSetStatus("error", "#f66"); };
+  // onclose fires after onerror; update to closed so the user sees terminal state.
+  ws.onclose = () => { wsOpen = false; wsSetStatus("closed", "#f66"); };
+}
+
+function wsDisconnect() {
+  if (ws) {
+    ws.onopen = ws.onerror = ws.onclose = null;
+    try { ws.close(); } catch (_) {}
+    ws = null;
+  }
+  wsOpen = false;
+  wsSetStatus("disconnected", "#aaa");
+}
+
+// Called from emit() — gated at 30/s. Drawing path is unaffected if WS is down.
+function wsSendPencil(msg) {
+  if (!wsOpen) return;
+  const now = performance.now();
+  if (now - wsLastSendT < WS_INTERVAL_MS) return;
+  wsLastSendT = now;
+  try {
+    ws.send(JSON.stringify(msg));
+    $("ws-sent").textContent = ++wsSentCount;
+  } catch (_) { /* socket closing — swallow */ }
+}
+
+$("ws-connect-btn").onclick    = () => wsConnect($("ws-url").value.trim());
+$("ws-disconnect-btn").onclick = wsDisconnect;
+$("ws-url").addEventListener("keydown", e => {
+  if (e.key === "Enter") wsConnect(e.target.value.trim());
+});
+
+// --- tilt/force availability probe: report what THIS device actually exposes ---
+function mark(el, present) { el.textContent = present ? "present" : "absent"; el.className = present ? "tilt-yes" : "tilt-no"; }
+let touchProbed = false;
+function probeTouch(t) {
+  if (touchProbed || !t) return; touchProbed = true;
+  mark($("p-alt"), "altitudeAngle" in t && t.altitudeAngle != null);   // PointerEvent row reused for Touch.altitude
+  mark($("p-tilt"), "azimuthAngle" in t && t.azimuthAngle != null);
+  mark($("p-talt"), "altitudeAngle" in t && t.altitudeAngle != null);
+  mark($("p-tforce"), "force" in t);
+}
+</script>
+</body>
+</html>
