@@ -198,6 +198,10 @@ None. Only `audio-engine/` was touched (`playback.js`, `server.js`,
   only unverified piece is the browser's DOM-event → `wsSendPencil()` →
   WebSocket path under real timing conditions.
 
+## Epic 7 cross-reference
+
+During Epic 7 integration, one seam was found in `audio-engine/src/server.js`: `createVelocitySmoother()` was called once globally and shared across all WebSocket connections, causing incorrect tremolo values when the pencil client reconnected. Fixed by moving the call inside `wss.on("connection", ...)`. See `docs/epic-7-integration.md` — "Integration seam identified and fixed" — for full details.
+
 ## Status
 
 Tag `epic-6-complete` created on commit `862dfc4` (the Epic 6 PR merge,
