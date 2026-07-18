@@ -25,13 +25,15 @@ async function main() {
   // — so this doesn't meaningfully delay the server becoming available.)
   // Epic 6: also pass through filterNode/pannerNode/lfo for pencil-driven
   // melody/timbre.
-  const { sourceNode, filterNode, pannerNode, lfo, playBeat, applyStressIntensity, playPluck } = await startPlayback();
+  const { sourceNode, filterNode, pannerNode, lfo, playBeat, applyStressIntensity, playPluck, switchBed } = await startPlayback();
 
   // Epic 8: fallback player replays pre-recorded sequences when live input
   // fails. Toggled by pressing f in this terminal.
   const fallbackPlayer = new FallbackPlayer({ sourceNode, filterNode, pannerNode, lfo });
 
-  const { setOppositeMood, setStaticMode } = startServer({ sourceNode, filterNode, pannerNode, lfo, fallbackPlayer, playBeat, applyStressIntensity, playPluck });
+  // Epic 9: switchBed is passed so zone profile crossfades apply to the real
+  // audio nodes. The server's mode/intention state is driven by WS messages.
+  const { setOppositeMood, setStaticMode } = startServer({ sourceNode, filterNode, pannerNode, lfo, fallbackPlayer, playBeat, applyStressIntensity, playPluck, switchBed });
 
   // Track toggle states locally so the keypress handler can flip them.
   let oppositeMoodOn = false;
