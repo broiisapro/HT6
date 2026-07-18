@@ -43,7 +43,6 @@ export function startServer({
   lfo = null,
 } = {}) {
   const wss = new WebSocketServer({ host: HOST, port: PORT });
-  const smoothVelocity = createVelocitySmoother();
 
   // ── No-data fallback timer ───────────────────────────────────────────────
   // If no biometric message arrives within STALE_TIMEOUT_MS, revert the bed
@@ -92,6 +91,11 @@ export function startServer({
 
   wss.on("connection", (socket, req) => {
     const remote = req.socket.remoteAddress;
+    // Epic 7 (integration fix): smoother is per-connection, not global. A shared
+    // EMA carries stale velocity state across reconnects, so the first strokes of a
+    // new drawing session blend with the previous session's final velocity —
+    // producing incorrect tremolo values. Fresh instance per connection avoids this.
+    const smoothVelocity = createVelocitySmoother();
     console.log(`[server] client connected from ${remote}`);
 
     socket.on("message", (raw) => {
