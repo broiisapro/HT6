@@ -6,6 +6,9 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Optional
 
+import cv2
+import numpy as np
+
 from human_midi_biometrics.biometric_source import BiometricSource
 from human_midi_biometrics.smoothing import ArBpmSmoother, OutlierGate
 
@@ -159,6 +162,54 @@ class PhoneCameraPpgSource(BiometricSource):
             return None
 
         bpm = 60.0 / median_interval
+        if bpm < 40 or bpm > 180:
+            return None
+        return bpm
+
+    def _estimate_bpm_autocorrelation(self) -> Optional[float]:
+        """Autocorrelation-based BPM estimator (Item 6).
+
+        Runs alongside the existing peak-based estimator.  Uses the detrended
+        red-channel signal over the rolling window and picks the lag with the
+        highest normalized autocorrelation in the physiologically valid range
+        (40–180 BPM).
+
+        Returns
+        -------
+        float | None
+            Estimated BPM, or None if signal is too short, too weak, or the
+            confidence threshold (R ≥ 0.3) is not met.
+        """
+        if len(self._red_signal) < 60:
+            return None
+
+        signal = np.array(self._red_signal, dtype=np.float64)
+        detrended = signal - np.mean(signal)
+        energy = np.sum(detrended ** 2)
+        if energy <= 1e-9:
+            return None
+
+        fps = self.fps_target
+        min_lag = max(1, int(60 / 180 * fps))   # 180 BPM: shortest physiological lag
+        max_lag = min(int(60 / 40 * fps), len(detrended) - 1)  # 40 BPM: longest
+
+        if min_lag >= max_lag:
+            return None
+
+        best_lag: Optional[int] = None
+        best_r: float = -1.0
+        for lag in range(min_lag, max_lag + 1):
+            if lag >= len(detrended):
+                break
+            r = float(np.dot(detrended[:-lag], detrended[lag:]) / energy)
+            if r > best_r:
+                best_r = r
+                best_lag = lag
+
+        if best_lag is None or best_r < 0.3:
+            return None
+
+        bpm = 60.0 * fps / best_lag
         if bpm < 40 or bpm > 180:
             return None
         return bpm
