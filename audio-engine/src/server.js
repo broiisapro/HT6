@@ -8,6 +8,10 @@ import {
   DEFAULT_PAN,
   STALE_TIMEOUT_MS as PENCIL_STALE_TIMEOUT_MS,
 } from "./pencil-mapper.js";
+import {
+  stressToDriveMix,
+  STALE_TIMEOUT_MS as STRESS_STALE_TIMEOUT_MS,
+} from "./stress-mapper.js";
 
 const HOST = "0.0.0.0";
 const PORT = 8765;
@@ -26,13 +30,20 @@ const PORT = 8765;
  *   for the documented mapping rationale. A separate, shorter stale-data
  *   timer reverts to filter/tremolo/pan defaults if no pencil message
  *   arrives for PENCIL_STALE_TIMEOUT_MS ms.
+ * Presage stress-layer addition: the same `type:"biometric"` message's
+ *   optional `stress` field (non-null only from a Presage source) drives
+ *   dryGain/wetGain via stressToDriveMix() — see stress-mapper.js. A third
+ *   independent stale timer reverts to dry (mix=0) if `stress` stops
+ *   arriving, without affecting bpm-driven tempo.
  *
  * @param {object} [opts]
  * @param {AudioBufferSourceNode|null} [opts.sourceNode] - The looping bed source.
  * @param {BiquadFilterNode|null} [opts.filterNode] - Epic 6 brightness filter.
  * @param {StereoPannerNode|null} [opts.pannerNode] - Epic 6 stereo pan.
  * @param {OscillatorNode|null} [opts.lfo] - Epic 6 tremolo-rate oscillator.
- *   All four are returned by startPlayback(). Any omitted/null node means
+ * @param {GainNode|null} [opts.dryGain] - Presage stress-layer dry path gain.
+ * @param {GainNode|null} [opts.wetGain] - Presage stress-layer drive/wet path gain.
+ *   All six are returned by startPlayback(). Any omitted/null node means
  *   its corresponding messages are still logged but not applied (safe
  *   degraded mode) — lets the server run standalone for testing.
  */
@@ -41,6 +52,8 @@ export function startServer({
   filterNode = null,
   pannerNode = null,
   lfo = null,
+  dryGain = null,
+  wetGain = null,
 } = {}) {
   const wss = new WebSocketServer({ host: HOST, port: PORT });
   const smoothVelocity = createVelocitySmoother();
@@ -81,6 +94,25 @@ export function startServer({
     }, PENCIL_STALE_TIMEOUT_MS);
   }
 
+  // ── Presage stress-layer no-data fallback timer ──────────────────────────
+  // Separate from the bpm stale timer: phone-camera/Polar sources send
+  // `stress: null` forever (never resets this timer), so the drive/wet mix
+  // correctly stays reverted to dry unless a Presage source is actually
+  // reporting a non-null value.
+  let stressStaleTimer = null;
+
+  function resetStressStaleTimer() {
+    if (stressStaleTimer) clearTimeout(stressStaleTimer);
+    stressStaleTimer = setTimeout(() => {
+      const { dryGain: defaultDry, wetGain: defaultWet } = stressToDriveMix(0);
+      console.log(
+        `[stress] no stress reading for ${STRESS_STALE_TIMEOUT_MS}ms — reverting to dry (mix=0)`
+      );
+      if (dryGain) dryGain.gain.setTargetAtTime(defaultDry, dryGain.context.currentTime, 0.05);
+      if (wetGain) wetGain.gain.setTargetAtTime(defaultWet, wetGain.context.currentTime, 0.05);
+    }, STRESS_STALE_TIMEOUT_MS);
+  }
+
   wss.on("listening", () => {
     console.log(`[server] contract WebSocket server listening on ws://${HOST}:${PORT}`);
     // Arm the stale timers immediately: if biometrics/ or pencil-input/ never
@@ -88,6 +120,7 @@ export function startServer({
     // than leaving whatever last value was set.
     resetStaleTimer();
     resetPencilStaleTimer();
+    resetStressStaleTimer();
   });
 
   wss.on("connection", (socket, req) => {
@@ -137,6 +170,24 @@ export function startServer({
           console.log(`[tempo] biometric received but no sourceNode — heart=${message.bpm} BPM (no-op)`);
         }
         resetStaleTimer();
+
+        // Presage stress layer: only non-null `stress` (Presage sources)
+        // drives the drive/wet mix and resets this timer — phone-camera/
+        // Polar's `stress: null` correctly leaves it reverting to dry.
+        if (typeof message.stress === "number") {
+          const { dryGain: mixDry, wetGain: mixWet } = stressToDriveMix(message.stress);
+          if (dryGain || wetGain) {
+            const now = (dryGain || wetGain).context.currentTime;
+            if (dryGain) dryGain.gain.setTargetAtTime(mixDry, now, 0.05);
+            if (wetGain) wetGain.gain.setTargetAtTime(mixWet, now, 0.05);
+            console.log(
+              `[stress] stress=${message.stress.toFixed(2)} → dryGain=${mixDry.toFixed(2)} wetGain=${mixWet.toFixed(2)}`
+            );
+          } else {
+            console.log(`[stress] stress received but no drive nodes — stress=${message.stress} (no-op)`);
+          }
+          resetStressStaleTimer();
+        }
       }
 
       if (message.type === "pencil") {

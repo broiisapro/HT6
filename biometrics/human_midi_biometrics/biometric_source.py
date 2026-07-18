@@ -25,3 +25,10 @@ class BiometricSource(ABC):
     @abstractmethod
     def get_bpm(self) -> Optional[float]:
         """Return latest smoothed bpm, or None if not available yet."""
+
+    def get_stress(self) -> Optional[float]:
+        """Return latest normalized stress index (0.0-1.0), or None if this
+        source doesn't produce one. Most sources don't override this -- only
+        ones that measure a genuinely separate signal (e.g. Presage's HRV
+        derived stress index) do."""
+        return None

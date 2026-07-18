@@ -69,8 +69,14 @@ class BiometricPipeline:
         if bpm is None:
             return None
         bpm = float(max(40.0, min(180.0, bpm)))
+
+        stress = self.source.get_stress()
+        if stress is not None:
+            stress = float(max(0.0, min(1.0, stress)))
+
         return {
             "type": "biometric",
             "bpm": round(bpm, 2),
+            "stress": round(stress, 3) if stress is not None else None,
             "timestamp": int(time.time() * 1000),
         }

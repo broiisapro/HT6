@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CUTOFF_HZ, DEFAULT_TREMOLO_HZ } from "./pencil-mapper.js";
+import { makeDriveCurve, stressToDriveMix } from "./stress-mapper.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BED_PATH = path.join(__dirname, "..", "assets", "bed.wav");
@@ -39,6 +40,13 @@ const TREMOLO_DEPTH = 0.15; // gain oscillates in [BASE-DEPTH, BASE+DEPTH] = [0.
  * (stereo position) -> tremoloGain (note-density proxy, driven by an LFO).
  * These are separate AudioParams from Epic 3's `sourceNode.playbackRate`
  * (tempo), so the two epics' live inputs never contend for the same knob.
+ *
+ * Presage stress-layer addition: pannerNode's output splits into a dry path
+ * (dryGain) and a distorted path (driveShaper -> wetGain), both feeding
+ * tremoloGain — Web Audio sums multiple inputs to the same node
+ * automatically. `stress` (0.0-1.0, Presage-only, see stress-mapper.js)
+ * crossfades dryGain/wetGain; this is a fourth independent control, never
+ * contending with tempo/filter/pan/tremolo.
  */
 export async function startPlayback() {
   const context = new AudioContext();
@@ -72,9 +80,25 @@ export async function startPlayback() {
   lfo.connect(lfoDepth);
   lfoDepth.connect(tremoloGain.gain);
 
+  // Presage stress-layer: dry/wet split around a fixed soft-clip curve.
+  // stressToDriveMix() default (stress=0) is dryGain=1, wetGain=0, so the
+  // chain is transparently clean until a Presage source actually reports
+  // stress > 0.
+  const driveShaper = context.createWaveShaper();
+  driveShaper.curve = makeDriveCurve();
+  const { dryGain: initialDry, wetGain: initialWet } = stressToDriveMix(0);
+  const dryGain = context.createGain();
+  dryGain.gain.value = initialDry;
+  const wetGain = context.createGain();
+  wetGain.gain.value = initialWet;
+
   sourceNode.connect(filterNode);
   filterNode.connect(pannerNode);
-  pannerNode.connect(tremoloGain);
+  pannerNode.connect(dryGain);
+  pannerNode.connect(driveShaper);
+  driveShaper.connect(wetGain);
+  dryGain.connect(tremoloGain);
+  wetGain.connect(tremoloGain);
   tremoloGain.connect(context.destination);
 
   sourceNode.start();
@@ -82,5 +106,5 @@ export async function startPlayback() {
 
   console.log(`[playback] looping ${BED_PATH} (${audioBuffer.duration.toFixed(1)}s bed)`);
 
-  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo };
+  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, dryGain, wetGain };
 }

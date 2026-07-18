@@ -23,8 +23,10 @@ async function main() {
   // — so this doesn't meaningfully delay the server becoming available.)
   // Epic 6: also pass through filterNode/pannerNode/lfo for pencil-driven
   // melody/timbre.
-  const { sourceNode, filterNode, pannerNode, lfo } = await startPlayback();
-  startServer({ sourceNode, filterNode, pannerNode, lfo });
+  // Presage stress-layer: also pass through dryGain/wetGain for stress-driven
+  // drive/tension mix.
+  const { sourceNode, filterNode, pannerNode, lfo, dryGain, wetGain } = await startPlayback();
+  startServer({ sourceNode, filterNode, pannerNode, lfo, dryGain, wetGain });
 }
 
 main().catch((err) => {

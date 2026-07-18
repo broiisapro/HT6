@@ -11,6 +11,11 @@ from human_midi_biometrics.sources.polar_phone_relay import (
     PolarPhoneRelayConfig,
     PolarPhoneRelaySource,
 )
+from human_midi_biometrics.sources.presage_cli import PresageCliConfig, PresageCliSource
+from human_midi_biometrics.sources.presage_phone_relay import (
+    PresagePhoneRelayConfig,
+    PresagePhoneRelaySource,
+)
 from human_midi_biometrics.sources.simulated import SimulatedBpmSource
 
 
@@ -18,7 +23,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Human MIDI biometrics sender")
     parser.add_argument(
         "--source",
-        choices=["phone-camera", "polar-ble", "polar-phone-relay", "simulated"],
+        choices=[
+            "phone-camera",
+            "polar-ble",
+            "polar-phone-relay",
+            "presage-cli",
+            "presage-phone-relay",
+            "simulated",
+        ],
         required=True,
         help="Biometric source implementation to run.",
     )
@@ -54,6 +66,26 @@ def parse_args() -> argparse.Namespace:
         default="0.0.0.0",
         help="Local bind host for Polar phone relay source.",
     )
+    parser.add_argument(
+        "--presage-command",
+        default="smartspectra-cli --continuous",
+        help=(
+            "Command to launch the installed Presage SmartSpectra example "
+            "app/CLI (per your OS's quickstart); its stdout is parsed for a "
+            "pulse-rate line. Only used by --source presage-cli."
+        ),
+    )
+    parser.add_argument(
+        "--presage-relay-port",
+        type=int,
+        default=8767,
+        help="Local HTTP port for the Presage iPhone relay source.",
+    )
+    parser.add_argument(
+        "--presage-relay-host",
+        default="0.0.0.0",
+        help="Local bind host for the Presage iPhone relay source.",
+    )
     return parser.parse_args()
 
 
@@ -70,6 +102,15 @@ async def run() -> None:
             config=PolarPhoneRelayConfig(
                 host=args.relay_host,
                 port=args.relay_port,
+            )
+        )
+    elif args.source == "presage-cli":
+        source = PresageCliSource(config=PresageCliConfig(command=args.presage_command))
+    elif args.source == "presage-phone-relay":
+        source = PresagePhoneRelaySource(
+            config=PresagePhoneRelayConfig(
+                host=args.presage_relay_host,
+                port=args.presage_relay_port,
             )
         )
     else:

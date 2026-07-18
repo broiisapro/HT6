@@ -13,13 +13,21 @@ JSON messages — fire-and-forget, no response expected for MVP.
 
 ```json
 // Sent by biometrics/
-{ "type": "biometric", "bpm": 72, "timestamp": 1737000000000 }
+{ "type": "biometric", "bpm": 72, "stress": null, "timestamp": 1737000000000 }
+{ "type": "biometric", "bpm": 72, "stress": 0.42, "timestamp": 1737000000000 }
 
 // Sent by pencil-input/
 { "type": "pencil", "pressure": 0.65, "x": 320.5, "y": 180.2, "velocity": 45.3, "tilt": null, "timestamp": 1737000000000 }
 ```
 
 - `bpm`: smoothed beats-per-minute, plausible human range 40–180.
+- `stress`: normalized 0.0 (calm) – 1.0 (tense) stress index, or `null` when
+  the active biometric source doesn't produce one (phone-camera, Polar).
+  Currently only the Presage SmartSpectra source populates this — see
+  `docs/presage-biometric-source.md`. This is a genuinely separate signal from
+  `bpm`, not derived from it: `bpm` drives tempo (Epic 3), `stress` drives a
+  distinct DSP control (drive/tension) so the two don't fight over the same
+  knob, the same way pencil's melody mapping (Epic 6) stays off tempo's knob.
 - `pressure`: 0.0–1.0, from the Pencil's `force` property.
 - `x`, `y`: canvas coordinates.
 - `velocity`: pixels/second, computed from position deltas over time.
