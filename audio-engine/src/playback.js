@@ -4,6 +4,23 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CUTOFF_HZ, DEFAULT_TREMOLO_HZ, DEFAULT_PAN } from "./pencil-mapper.js";
 
+/** Thump synth constants (Item 3 — beat events). */
+const THUMP_FREQ_HZ     = 60;    // fundamental: low sine rumble
+const THUMP_ATTACK_S    = 0.002; // 2ms attack
+const THUMP_DECAY_S     = 0.2;   // 200ms exponential decay
+
+/** Pluck synth constants (Item 5 — pencil melody voice). */
+const PLUCK_ATTACK_S   = 0.005;  // 5ms attack
+const PLUCK_DECAY_S    = 0.6;    // 600ms exponential decay (mid of 400–800ms)
+const PLUCK_GAIN       = 0.4;    // peak gain
+
+/** Stress layer constants (Item 4 — stress-spike triggered chain). */
+const STRESS_BP_LOW_HZ  = 200;   // bandpass centre at intensity=0
+const STRESS_BP_HIGH_HZ = 4000;  // bandpass centre at intensity=1
+const STRESS_BED_DUCK   = 0.6;   // main-bed gain dip on PEAK entry
+const STRESS_DUCK_TC    = 0.04;  // setTargetAtTime TC for duck (150ms dip)
+const STRESS_RECOVER_TC = 0.3;   // setTargetAtTime TC for duck recovery
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ASSETS_DIR = path.join(__dirname, "..", "assets");
 const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".ogg"]);
@@ -12,7 +29,7 @@ const DEFAULT_ZONE = "calm";
 /** Crossfade duration (seconds) when switching zones. */
 const CROSSFADE_SEC = 0.6;
 
-/** Tremolo (Epic 6) gain-modulation constants — see playback.js on main for origin. */
+/** Tremolo (Epic 6) gain-modulation constants. */
 const TREMOLO_BASE_GAIN = 0.85;
 const TREMOLO_DEPTH = 0.15; // gain oscillates in [BASE-DEPTH, BASE+DEPTH] = [0.7, 1.0]
 
@@ -47,38 +64,32 @@ function pickRandom(list) {
 }
 
 /**
- * Loads mood-zone tracks (audio-engine/assets/<zone>/*) and loops a
- * randomly-picked track from the current zone through a persistent
- * filter -> pan -> tremolo effects chain to the system audio output, via
- * node-web-audio-api (a native, non-browser Web Audio API implementation —
- * see docs/epic-2-audio-engine-scaffold.md for why Tone.js was dropped).
+ * Loads mood-zone tracks and loops a randomly-picked track from the current
+ * zone through a persistent filter -> pan -> tremolo effects chain to the
+ * system audio output, via node-web-audio-api.
  *
- * ── Persistent effects chain ────────────────────────────────────────────
+ * ── Persistent effects chain (survives zone switches) ───────────────────
  * filterNode (lowpass, brightness) -> pannerNode (stereo position) ->
- * tremoloGain (note-density proxy, driven by an LFO) -> destination. These
- * three nodes are created once and never torn down — Epic 6's
- * pencil-mapper.js output targets them directly via setMelodyParams(), and
- * they keep working unchanged across zone switches, since switchBed() only
- * ever replaces what feeds *into* the front of this chain.
+ * tremoloGain (note-density proxy, driven by an LFO) -> destination.
  *
  * ── Zone switching + crossfade ──────────────────────────────────────────
- * Each zone's source gets its own per-source gain node (not shared) so an
- * outgoing and incoming track can overlap briefly: switchBed() ramps the
- * new source's gain 0->1 and the old one's 1->0 over CROSSFADE_SEC, then
- * stops/disconnects the old source once the fade completes. This avoids
- * the hard stop/start cut of the original single-zone version.
+ * switchBed() ramps the new source gain 0->1 and the old one 1->0 over
+ * CROSSFADE_SEC, then stops/disconnects the old source after the fade.
  *
- * ── Tempo ────────────────────────────────────────────────────────────────
- * setTempo(rate) applies playbackRate to whichever source is currently the
- * active (post-crossfade) one — callers don't need to track node identity
- * across zone switches.
+ * ── Item 3: Beat thump synth ────────────────────────────────────────────
+ * playBeat() fires a short low-sine oscillator on each detected heartbeat.
  *
- * Epic 3 hook point: biometric-zone-mapper.js's createZoneTracker()/
- * bpmToPlaybackRateWithinZone() decide *which* zone and *what* rate; call
- * switchBed(zone) and setTempo(rate) from server.js's message handler.
- * Epic 6 hook point: pencil-mapper.js's pencilToAudioParams() decides
- * cutoff/tremolo/pan; call setMelodyParams({cutoffHz, tremoloHz, pan}) from
- * the same handler.
+ * ── Item 4: Stress noise layer ──────────────────────────────────────────
+ * A looping white-noise buffer runs through a bandpass filter + gain node.
+ * applyStressIntensity() sweeps the bandpass and gain per message, and
+ * optionally ducks the main bed on PEAK entry for a sidechain effect.
+ *
+ * ── Item 5: Monophonic pluck voice ──────────────────────────────────────
+ * playPluck() triggers (or retriggers) a triangle-wave oscillator with an
+ * exponential envelope, silencing the previous note cleanly on retrigger.
+ *
+ * @param {string} [initialZone] - Zone to start from (defaults to DEFAULT_ZONE
+ *   if available, otherwise the first playable zone).
  */
 export async function startPlayback(initialZone) {
   const context = new AudioContext();
@@ -107,6 +118,127 @@ export async function startPlayback(initialZone) {
   pannerNode.connect(tremoloGain);
   tremoloGain.connect(context.destination);
   lfo.start();
+
+  // ── Item 4: Stress layer ──────────────────────────────────────────────────
+  // White noise → bandpass filter → gain node driven by intensity01.
+  // Self-contained parallel chain, no interaction with the bed chain.
+  const NOISE_BUFFER_SIZE = context.sampleRate * 2; // 2 seconds of noise
+  const noiseBuffer = context.createBuffer(1, NOISE_BUFFER_SIZE, context.sampleRate);
+  const noiseData = noiseBuffer.getChannelData(0);
+  for (let i = 0; i < NOISE_BUFFER_SIZE; i++) noiseData[i] = Math.random() * 2 - 1;
+
+  const noiseSource = context.createBufferSource();
+  noiseSource.buffer = noiseBuffer;
+  noiseSource.loop = true;
+
+  const stressBandpass = context.createBiquadFilter();
+  stressBandpass.type = "bandpass";
+  stressBandpass.frequency.value = STRESS_BP_LOW_HZ;
+  stressBandpass.Q.value = 1.5;
+
+  const stressGain = context.createGain();
+  stressGain.gain.value = 0; // silent until triggered
+
+  noiseSource.connect(stressBandpass);
+  stressBandpass.connect(stressGain);
+  stressGain.connect(context.destination);
+  noiseSource.start();
+
+  /**
+   * Apply stress intensity to the triggered noise layer.
+   * Called by server.js on every biometric message.
+   * @param {number} intensity01  - 0..1, output of createStressStateMachine().update().
+   * @param {boolean} isPeakEntry - true on the first call after entering PEAK state.
+   */
+  function applyStressIntensity(intensity01, isPeakEntry = false) {
+    const now = context.currentTime;
+    // Sweep bandpass centre: STRESS_BP_LOW at 0, STRESS_BP_HIGH at 1.
+    const bpFreq = STRESS_BP_LOW_HZ * Math.pow(STRESS_BP_HIGH_HZ / STRESS_BP_LOW_HZ, intensity01);
+    stressBandpass.frequency.setTargetAtTime(bpFreq, now, 0.05);
+    stressGain.gain.setTargetAtTime(intensity01, now, 0.05);
+
+    // Optional sidechain-style bed duck on PEAK entry.
+    if (isPeakEntry) {
+      tremoloGain.gain.setTargetAtTime(STRESS_BED_DUCK, now, STRESS_DUCK_TC);
+      tremoloGain.gain.setTargetAtTime(TREMOLO_BASE_GAIN, now + 0.15, STRESS_RECOVER_TC);
+    }
+  }
+
+  /**
+   * Fire one low-sine thump for a detected heartbeat.
+   * Web Audio oscillators are single-use — create a fresh one each call.
+   * @param {number} [peakGain=0.5] - 0..1 volume of the thump.
+   */
+  function playBeat(peakGain = 0.5) {
+    const now = context.currentTime;
+    const osc  = context.createOscillator();
+    const gain = context.createGain();
+
+    osc.type = "sine";
+    osc.frequency.value = THUMP_FREQ_HZ;
+
+    // Linear ramp up over THUMP_ATTACK_S, then exponential decay to near-zero.
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(peakGain, now + THUMP_ATTACK_S);
+    gain.gain.setTargetAtTime(0.0001, now + THUMP_ATTACK_S, THUMP_DECAY_S / 3);
+
+    osc.connect(gain);
+    gain.connect(context.destination);
+
+    osc.start(now);
+    // Auto-stop well after decay completes to free resources.
+    osc.stop(now + THUMP_ATTACK_S + THUMP_DECAY_S * 4);
+  }
+
+  // ── Item 5: monophonic pluck voice state ─────────────────────────────────
+  // Single active oscillator+gain pair; replaced on each retrigger.
+  let _pluckOsc  = null;
+  let _pluckGain = null;
+
+  /**
+   * Trigger (or retrigger) the monophonic pluck voice at `freqHz`.
+   * Silences the previous note's oscillator immediately — the natural
+   * PLUCK_DECAY_S decay still plays through on the gain envelope, but we
+   * don't let the oscillator keep running at the old frequency.
+   * @param {number} freqHz - Note frequency (Hz).
+   */
+  function playPluck(freqHz) {
+    const now = context.currentTime;
+
+    // Stop previous oscillator cleanly (doesn't cut the envelope — gain
+    // handles the fade; stopping the osc removes the old pitch immediately).
+    if (_pluckOsc) {
+      try { _pluckOsc.stop(now); } catch (_) {}
+      _pluckOsc = null;
+    }
+    if (_pluckGain) {
+      // Cancel scheduled values and ramp out quickly to avoid clicks.
+      _pluckGain.gain.cancelScheduledValues(now);
+      _pluckGain.gain.setTargetAtTime(0, now, 0.01);
+    }
+
+    // Create fresh oscillator + envelope gain (single-use oscillators).
+    const osc  = context.createOscillator();
+    const gain = context.createGain();
+
+    osc.type = "triangle";
+    osc.frequency.value = freqHz;
+
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(PLUCK_GAIN, now + PLUCK_ATTACK_S);
+    gain.gain.setTargetAtTime(0.0001, now + PLUCK_ATTACK_S, PLUCK_DECAY_S / 3);
+
+    osc.connect(gain);
+    gain.connect(context.destination);
+
+    osc.start(now);
+    osc.stop(now + PLUCK_ATTACK_S + PLUCK_DECAY_S * 5);
+
+    _pluckOsc  = osc;
+    _pluckGain = gain;
+  }
+
+  // ── Zone-based bed management ─────────────────────────────────────────────
 
   async function getDecodedBuffer(filePath) {
     if (!decodedCache.has(filePath)) {
@@ -191,7 +323,26 @@ export async function startPlayback(initialZone) {
   const startZone = initialZone ?? (playableZones.includes(DEFAULT_ZONE) ? DEFAULT_ZONE : playableZones[0]);
   await switchBed(startZone);
 
-  return { context, zone: startZone, switchBed, setTempo, setMelodyParams, revertMelodyDefaults };
+  return {
+    context,
+    zone: startZone,
+    // Zone-based bed management
+    switchBed,
+    setTempo,
+    setMelodyParams,
+    revertMelodyDefaults,
+    // Persistent effects chain nodes (needed by FallbackPlayer + server.js stale reverts)
+    filterNode,
+    pannerNode,
+    tremoloGain,
+    lfo,
+    // Item 3: per-heartbeat thump synth
+    playBeat,
+    // Item 4: stress noise layer
+    applyStressIntensity,
+    // Item 5: monophonic pluck voice
+    playPluck,
+  };
 }
 
 export { DEFAULT_ZONE };

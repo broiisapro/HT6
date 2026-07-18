@@ -14,6 +14,12 @@ import {
   clampBpm,
   createBpmRateLimiter,
   applyMoodInversion,
+  createStressStateMachine,
+  STRESS_STATE,
+  RISE_RATE_THRESHOLD,
+  MIN_CONSECUTIVE_SAMPLES,
+  RELEASE_TIME_MS,
+  COOLDOWN_MS,
   BED_BPM,
   INPUT_MIN_BPM,
   INPUT_MAX_BPM,
@@ -22,7 +28,10 @@ import {
 
 import {
   pencilToAudioParams,
+  quantizePitch,
   createVelocitySmoother,
+  PENTATONIC_FREQS,
+  PITCH_Y_MAX,
   MIN_CUTOFF_HZ,
   MAX_CUTOFF_HZ,
   DEFAULT_CUTOFF_HZ,
@@ -309,7 +318,148 @@ test("pencilToAudioParams: x out of bounds clamps to [-1, 1]", () => {
   assert.ok(Math.abs(right - 1) < 0.001, `got ${right}`);
 });
 
-// ── createVelocitySmoother — EMA behaviour ───────────────────────────────────
+// ── quantizePitch ─────────────────────────────────────────────────────────────────
+
+test("quantizePitch: y=0 (top) → highest note (A4 = 440 Hz)", () => {
+  const { freqHz, index } = quantizePitch(0);
+  const n = PENTATONIC_FREQS.length;
+  assert.ok(Math.abs(freqHz - PENTATONIC_FREQS[n - 1]) < 0.01,
+    `y=0 should be highest note ${PENTATONIC_FREQS[n-1]}Hz, got ${freqHz}`);
+  assert.strictEqual(index, n - 1);
+});
+
+test("quantizePitch: y=PITCH_Y_MAX (bottom) → lowest note (A3 = 220 Hz)", () => {
+  const { freqHz, index } = quantizePitch(PITCH_Y_MAX);
+  assert.ok(Math.abs(freqHz - PENTATONIC_FREQS[0]) < 0.01,
+    `y=PITCH_Y_MAX should be lowest note ${PENTATONIC_FREQS[0]}Hz, got ${freqHz}`);
+  assert.strictEqual(index, 0);
+});
+
+test("quantizePitch: result freq is always a member of PENTATONIC_FREQS", () => {
+  // Sample 20 y values across the full range.
+  for (let i = 0; i <= 20; i++) {
+    const y = (i / 20) * PITCH_Y_MAX;
+    const { freqHz } = quantizePitch(y);
+    assert.ok(
+      PENTATONIC_FREQS.some(f => Math.abs(f - freqHz) < 0.01),
+      `quantizePitch(${y}) = ${freqHz} is not in PENTATONIC_FREQS`
+    );
+  }
+});
+
+test("quantizePitch: out-of-bounds y clamps (no crash, valid result)", () => {
+  const { freqHz: low } = quantizePitch(-100);
+  const { freqHz: high } = quantizePitch(PITCH_Y_MAX + 100);
+  assert.ok(PENTATONIC_FREQS.some(f => Math.abs(f - low) < 0.01),
+    `y=-100 should clamp to valid note, got ${low}`);
+  assert.ok(PENTATONIC_FREQS.some(f => Math.abs(f - high) < 0.01),
+    `y=PITCH_Y_MAX+100 should clamp to valid note, got ${high}`);
+});
+
+test("quantizePitch: each bucket edge maps to the expected note", () => {
+  // Bucket i spans t in [i/n, (i+1)/n), where t=1-y/yMax.
+  // At the exact upper edge of t for bucket i, we should get PENTATONIC_FREQS[i].
+  const n = PENTATONIC_FREQS.length;
+  for (let i = 0; i < n; i++) {
+    // t value at the centre of bucket i
+    const t = (i + 0.5) / n;
+    const y = (1 - t) * PITCH_Y_MAX;
+    const { freqHz, index } = quantizePitch(y);
+    assert.strictEqual(index, i,
+      `Bucket centre t=${t.toFixed(3)} y=${y.toFixed(1)}: expected index=${i}, got ${index}`);
+    assert.ok(Math.abs(freqHz - PENTATONIC_FREQS[i]) < 0.01,
+      `Bucket ${i}: expected ${PENTATONIC_FREQS[i]}Hz, got ${freqHz}Hz`);
+  }
+});
+
+// ── createStressStateMachine ──────────────────────────────────────────────────────
+
+test("stressMachine: steady-state BPM stays CALM", () => {
+  const sm = createStressStateMachine();
+  let now = 0;
+  // Feed 10 messages with a steady 75 BPM (no rise)
+  for (let i = 0; i < 10; i++) {
+    now += 1000;
+    sm.update(75, now);
+  }
+  assert.strictEqual(sm.getState(), STRESS_STATE.CALM, "steady signal must stay CALM");
+});
+
+test("stressMachine: scripted BPM rise sequence reaches PEAK", () => {
+  const sm = createStressStateMachine();
+  // First message: establishes baseline at 70 BPM.
+  sm.update(70, 0);
+
+  // Each subsequent message 1s later, rising at RISE_RATE_THRESHOLD + 1 BPM/sec.
+  // Should trigger RISING after MIN_CONSECUTIVE_SAMPLES, then PEAK.
+  const risePerSec = RISE_RATE_THRESHOLD + 2; // above threshold
+  let bpm = 70;
+  let reachedPeak = false;
+  for (let i = 1; i <= 10; i++) {
+    bpm += risePerSec;
+    sm.update(bpm, i * 1000);
+    if (sm.getState() === STRESS_STATE.PEAK || sm.getState() === STRESS_STATE.RELEASING) {
+      reachedPeak = true;
+      break;
+    }
+  }
+  assert.ok(reachedPeak, `Expected PEAK or RELEASING, got ${sm.getState()}`);
+});
+
+test("stressMachine: intensity01 is exactly 0.0 at elapsed = RELEASE_TIME_MS (Fix B — no boundary jump)", () => {
+  // Regression test for the exponential-decay bug where Math.exp(-1) ≈ 0.368
+  // was hard-overridden to 0 in the same tick, causing a ~0.37 gain jump.
+  // The linear decay formula must reach exactly 0 at the boundary with no override.
+  const sm = createStressStateMachine();
+
+  // Step 1: init at t=0.
+  sm.update(70, 0);
+
+  // Step 2-3: scripted rise above RISE_RATE_THRESHOLD for MIN_CONSECUTIVE_SAMPLES.
+  const risePerSec = RISE_RATE_THRESHOLD + 6; // well above threshold
+  sm.update(70 + risePerSec, 1000);   // risingCount = 1
+  sm.update(70 + 2 * risePerSec, 2000); // risingCount = 2 → RISING (risingStartMs=2000, baseline≈70)
+
+  // Step 4: dBpmDt drops → PEAK entered at t=3000; peakEntryMs=3000.
+  sm.update(70 + 2 * risePerSec - 2, 3000); // dBpmDt = -2 <= 0 → PEAK
+  assert.strictEqual(sm.getState(), STRESS_STATE.PEAK, "should be in PEAK after rise reversal");
+
+  // Step 5: PEAK → RELEASING (one tick).
+  sm.update(70 + 2 * risePerSec - 2, 4000);
+  assert.strictEqual(sm.getState(), STRESS_STATE.RELEASING, "should be in RELEASING after PEAK tick");
+
+  // Step 6: advance to exactly peakEntryMs + RELEASE_TIME_MS = 3000 + 6000 = 9000.
+  // BPM is kept far from baseline (baseline ≈ 70, feeding 88 → |88-70|=18 > RELEASE_BAND_BPM=5)
+  // to prevent early-exit via bpmNearBaseline.
+  const intensity = sm.update(70 + 2 * risePerSec - 2, 3000 + RELEASE_TIME_MS);
+
+  // Linear formula: max(0, 1 - 6000/6000) = 0 exactly.
+  assert.strictEqual(intensity, 0, `intensity01 at RELEASE_TIME_MS boundary must be exactly 0, got ${intensity}`);
+  assert.strictEqual(sm.getState(), STRESS_STATE.CALM, "should transition to CALM at boundary");
+});
+
+test("stressMachine: cooldown blocks immediate re-trigger after RELEASING", () => {
+  const sm = createStressStateMachine();
+  // Manually drive through to CALM via forceCalm to simulate end of release.
+  sm.update(70, 0);
+  sm.forceCalm(); // returns to CALM, sets cooldown timer
+
+  // Immediately try to trigger RISING — should be blocked by cooldown.
+  const risePerSec = RISE_RATE_THRESHOLD + 5;
+  let bpm = 70;
+  for (let i = 1; i <= MIN_CONSECUTIVE_SAMPLES + 2; i++) {
+    bpm += risePerSec;
+    sm.update(bpm, i * 1000); // within COOLDOWN_MS (3s)
+  }
+  // Cooldown is 3000ms; we only advanced 3 seconds total at 1s/step.
+  // State should still be CALM (blocked by cooldown).
+  assert.strictEqual(
+    sm.getState(), STRESS_STATE.CALM,
+    `Cooldown should block re-trigger; got ${sm.getState()}`
+  );
+});
+
+// ── createVelocitySmoother — EMA behaviour ─────────────────────────────────────────
 
 test("createVelocitySmoother: first call returns raw value (no prior state)", () => {
   const smooth = createVelocitySmoother();

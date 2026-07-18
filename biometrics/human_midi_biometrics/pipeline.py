@@ -11,6 +11,10 @@ import websockets
 
 from human_midi_biometrics.biometric_source import BiometricSource
 
+# Minimum milliseconds between forwarded beat events (server-side debounce is
+# separate; this is a client-side guard against rapid double-detection).
+_MIN_BEAT_INTERVAL_MS = 300
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +40,10 @@ class BiometricPipeline:
         finally:
             await self.source.stop()
 
+    def _get_beat_queue(self):
+        """Return the source's beat queue if it exposes one, else None."""
+        return getattr(self.source, "get_beat_events", lambda: None)()
+
     async def _run_mock_loop(self) -> None:
         while True:
             payload = self._next_payload()
@@ -51,18 +59,58 @@ class BiometricPipeline:
             try:
                 async with websockets.connect(self.config.websocket_url) as ws:
                     logger.info("Connected to websocket server: %s", self.config.websocket_url)
-                    while True:
-                        payload = self._next_payload()
-                        if payload:
-                            await ws.send(json.dumps(payload))
-                            print(
-                                f"[WS] sent bpm={payload['bpm']:.1f} "
-                                f"timestamp={payload['timestamp']}"
-                            )
-                        await asyncio.sleep(self.config.send_interval_seconds)
+                    beat_queue = self._get_beat_queue()
+                    if beat_queue is not None:
+                        beat_task = asyncio.create_task(
+                            self._run_beat_drain_task(ws, beat_queue)
+                        )
+                    else:
+                        beat_task = None
+                    try:
+                        while True:
+                            payload = self._next_payload()
+                            if payload:
+                                await ws.send(json.dumps(payload))
+                                print(
+                                    f"[WS] sent bpm={payload['bpm']:.1f} "
+                                    f"timestamp={payload['timestamp']}"
+                                )
+                            await asyncio.sleep(self.config.send_interval_seconds)
+                    finally:
+                        if beat_task is not None:
+                            beat_task.cancel()
+                            try:
+                                await beat_task
+                            except asyncio.CancelledError:
+                                pass
             except Exception as exc:
                 logger.warning("WebSocket connection failed (%s). Retrying in 2s.", exc)
                 await asyncio.sleep(2)
+
+    async def _run_beat_drain_task(
+        self, ws: "websockets.WebSocketClientProtocol", beat_queue: asyncio.Queue
+    ) -> None:
+        """Drain beat events from the source queue and forward immediately.
+
+        No batching: each beat fires as soon as it is dequeued.  The source
+        already rate-limits via minimum_peak_distance_seconds; this task adds
+        a _MIN_BEAT_INTERVAL_MS client-side guard against double-emission.
+        """
+        last_sent_ms: int = 0
+        while True:
+            beat_ts: int = await beat_queue.get()
+            now_ms = int(time.time() * 1000)
+            # Client-side debounce: drop beats closer than _MIN_BEAT_INTERVAL_MS.
+            if now_ms - last_sent_ms < _MIN_BEAT_INTERVAL_MS:
+                continue
+            last_sent_ms = now_ms
+            payload = {"type": "beat", "timestamp": beat_ts}
+            try:
+                await ws.send(json.dumps(payload))
+                print(f"[WS] beat ts={beat_ts}")
+            except Exception as exc:
+                logger.warning("Beat send failed: %s", exc)
+                break  # outer loop will reconnect
 
     def _next_payload(self) -> Optional[dict]:
         bpm = self.source.get_bpm()

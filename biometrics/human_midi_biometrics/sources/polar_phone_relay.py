@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Deque, Optional
 
 from human_midi_biometrics.biometric_source import BiometricSource
-from human_midi_biometrics.smoothing import RollingBpmSmoother
+from human_midi_biometrics.smoothing import ArBpmSmoother, OutlierGate
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,8 @@ class PolarPhoneRelayConfig:
 class PolarPhoneRelaySource(BiometricSource):
     def __init__(self, config: PolarPhoneRelayConfig | None = None) -> None:
         self.config = config or PolarPhoneRelayConfig()
-        self._smoother = RollingBpmSmoother(window_size=5)
+        self._outlier_gate = OutlierGate()
+        self._smoother = ArBpmSmoother(window_size=5)
         self._latest_bpm: Optional[float] = None
         self._last_rx_ts: Optional[float] = None
         self._raw_buffer: Deque[float] = deque(maxlen=self.config.buffer_size)
@@ -109,7 +110,10 @@ class PolarPhoneRelaySource(BiometricSource):
     def _ingest_hr(self, hr_value: float) -> None:
         with self._lock:
             self._raw_buffer.append(hr_value)
-            smoothed = self._smoother.add(hr_value)
+            accepted = self._outlier_gate.filter(hr_value)
+            if accepted is None:
+                return
+            smoothed = self._smoother.add(accepted)
             if smoothed is None:
                 return
             self._latest_bpm = smoothed

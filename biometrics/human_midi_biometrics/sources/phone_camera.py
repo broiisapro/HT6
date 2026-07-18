@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from human_midi_biometrics.biometric_source import BiometricSource
-from human_midi_biometrics.smoothing import RollingBpmSmoother
+from human_midi_biometrics.smoothing import ArBpmSmoother, OutlierGate
 
 
 @dataclass
@@ -38,7 +38,16 @@ class PhoneCameraPpgSource(BiometricSource):
         self._timestamps: Deque[float] = deque()
         self._red_signal: Deque[float] = deque()
         self._smoothed_bpm: Optional[float] = None
-        self._bpm_smoother = RollingBpmSmoother(window_size=6)
+        self._outlier_gate = OutlierGate()
+        self._bpm_smoother = ArBpmSmoother(window_size=6)
+
+        # Beat event queue: each entry is a beat timestamp (ms, epoch).
+        # Pipeline drains this queue via get_beat_events().
+        self._beat_queue: asyncio.Queue[int] = asyncio.Queue()
+        # Timestamp-based watermark: wall-clock time (seconds) of the last peak
+        # we emitted a beat for.  Immune to index drift caused by _trim_window()
+        # popping from the front of the deque each frame.
+        self._last_emitted_peak_ts: float = -1.0
 
     async def start(self) -> None:
         self._capture = cv2.VideoCapture(self.camera_index)
@@ -64,6 +73,10 @@ class PhoneCameraPpgSource(BiometricSource):
     def get_bpm(self) -> Optional[float]:
         return self._smoothed_bpm
 
+    def get_beat_events(self) -> "asyncio.Queue[int]":
+        """Return the asyncio.Queue that receives beat timestamps (epoch ms)."""
+        return self._beat_queue
+
     async def _capture_loop(self) -> None:
         assert self._capture is not None
         frame_delay = max(0.001, 1.0 / self.fps_target)
@@ -84,9 +97,11 @@ class PhoneCameraPpgSource(BiometricSource):
 
             bpm = self._estimate_bpm()
             if bpm is not None:
-                smoothed = self._bpm_smoother.add(bpm)
-                if smoothed is not None:
-                    self._smoothed_bpm = smoothed
+                accepted = self._outlier_gate.filter(bpm)
+                if accepted is not None:
+                    smoothed = self._bpm_smoother.add(accepted)
+                    if smoothed is not None:
+                        self._smoothed_bpm = smoothed
 
             await asyncio.sleep(frame_delay)
 
@@ -95,6 +110,19 @@ class PhoneCameraPpgSource(BiometricSource):
         while self._timestamps and self._timestamps[0] < oldest_allowed:
             self._timestamps.popleft()
             self._red_signal.popleft()
+
+    def _emit_new_beats(self, candidate_indices: list, timestamps: "np.ndarray") -> None:
+        """Enqueue beat events for any peaks past the timestamp watermark.
+
+        Uses timestamps rather than deque indices so the watermark is immune
+        to the index drift caused by _trim_window() popping from the front of
+        the deque on every frame.
+        """
+        for idx in candidate_indices:
+            if timestamps[idx] > self._last_emitted_peak_ts:
+                beat_ts = int(timestamps[idx] * 1000)  # epoch ms
+                self._beat_queue.put_nowait(beat_ts)
+                self._last_emitted_peak_ts = timestamps[idx]
 
     def _estimate_bpm(self) -> Optional[float]:
         if len(self._red_signal) < 30:
@@ -125,6 +153,9 @@ class PhoneCameraPpgSource(BiometricSource):
             candidate_indices.append(i)
             last_peak_time = t
 
+        # Emit beat events immediately for any new peaks past the watermark.
+        self._emit_new_beats(candidate_indices, timestamps)
+
         if len(candidate_indices) < 2:
             return None
 
@@ -138,6 +169,54 @@ class PhoneCameraPpgSource(BiometricSource):
             return None
 
         bpm = 60.0 / median_interval
+        if bpm < 40 or bpm > 180:
+            return None
+        return bpm
+
+    def _estimate_bpm_autocorrelation(self) -> Optional[float]:
+        """Autocorrelation-based BPM estimator (Item 6).
+
+        Runs alongside the existing peak-based estimator.  Uses the detrended
+        red-channel signal over the rolling window and picks the lag with the
+        highest normalized autocorrelation in the physiologically valid range
+        (40–180 BPM).
+
+        Returns
+        -------
+        float | None
+            Estimated BPM, or None if signal is too short, too weak, or the
+            confidence threshold (R ≥ 0.3) is not met.
+        """
+        if len(self._red_signal) < 60:
+            return None
+
+        signal = np.array(self._red_signal, dtype=np.float64)
+        detrended = signal - np.mean(signal)
+        energy = np.sum(detrended ** 2)
+        if energy <= 1e-9:
+            return None
+
+        fps = self.fps_target
+        min_lag = max(1, int(60 / 180 * fps))   # 180 BPM: shortest physiological lag
+        max_lag = min(int(60 / 40 * fps), len(detrended) - 1)  # 40 BPM: longest
+
+        if min_lag >= max_lag:
+            return None
+
+        best_lag: Optional[int] = None
+        best_r: float = -1.0
+        for lag in range(min_lag, max_lag + 1):
+            if lag >= len(detrended):
+                break
+            r = float(np.dot(detrended[:-lag], detrended[lag:]) / energy)
+            if r > best_r:
+                best_r = r
+                best_lag = lag
+
+        if best_lag is None or best_r < 0.3:
+            return None
+
+        bpm = 60.0 * fps / best_lag
         if bpm < 40 or bpm > 180:
             return None
         return bpm
