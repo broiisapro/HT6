@@ -35,10 +35,10 @@
     <div class="row"><span>velocity px/s</span><span id="v-vel">–</span></div>
     <div class="row"><span>tilt (deg)</span><span id="v-tilt">–</span></div>
     <hr style="border-color:#333;margin:12px 0">
-    <div class="row"><span>PointerEvent.altitudeAngle</span><span id="p-alt">?</span></div>
-    <div class="row"><span>PointerEvent.tiltX/Y</span><span id="p-tilt">?</span></div>
+    <div class="row"><span>Touch.force (pressure)</span><span id="p-tforce">?</span></div>
     <div class="row"><span>Touch.altitudeAngle</span><span id="p-talt">?</span></div>
-    <div class="row"><span>Touch.force</span><span id="p-tforce">?</span></div>
+    <div class="row"><span>Touch.azimuthAngle</span><span id="p-tilt">?</span></div>
+    <div class="row" style="display:none"><span id="p-alt"></span></div>
     <button id="clear">Clear canvas</button>
   </div>
 </div>
@@ -68,68 +68,76 @@ const RATE_MS = 1000 / 60;
 
 function draw(x, y, pressure) {
   if (!last) return;
-  ctx.strokeStyle = `hsl(${200 + pressure * 120}, 90%, ${40 + pressure * 40}%)`;
-  ctx.lineWidth = 1 + pressure * 24;            // pressure -> thickness
+  const p = Math.max(0, Math.min(1, pressure));   // clamp for visuals only
+  ctx.strokeStyle = `hsl(${200 + p * 120}, 90%, ${40 + p * 40}%)`;
+  ctx.lineWidth = 1 + p * 24;                      // pressure -> thickness
   ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(x, y); ctx.stroke();
 }
 
-function report(e) {
-  const x = e.clientX, y = e.clientY, t = e.timeStamp;
-  const pressure = e.pressure;                  // 0..1 for pen; ~0.5 for mouse-down
+// One HUD update from a normalized sample, whatever the source (pen or mouse).
+function emit(s) {   // s = { x, y, t, pressure, type, tiltDeg|null }
   let vel = 0;
-  if (last) vel = velocity(last.x, last.y, last.t, x, y, t);
+  if (last) vel = velocity(last.x, last.y, last.t, s.x, s.y, s.t);
   velEMA = velEMA * 0.8 + vel * 0.2;
-
-  draw(x, y, pressure);
-  last = { x, y, t };
-
-  $("v-type").textContent = e.pointerType;
-  $("v-pressure").textContent = pressure.toFixed(3);
-  $("v-x").textContent = x.toFixed(1);
-  $("v-y").textContent = y.toFixed(1);
+  draw(s.x, s.y, s.pressure);
+  last = { x: s.x, y: s.y, t: s.t };
+  $("v-type").textContent = s.type;
+  $("v-pressure").textContent = s.pressure.toFixed(3);
+  $("v-x").textContent = s.x.toFixed(1);
+  $("v-y").textContent = s.y.toFixed(1);
   $("v-vel").textContent = velEMA.toFixed(0);
-  const tiltDeg = ("altitudeAngle" in e && e.altitudeAngle != null)
-    ? (90 - e.altitudeAngle * 180 / Math.PI).toFixed(1)   // altitude -> tilt-from-vertical
-    : (("tiltX" in e && e.tiltX) ? e.tiltX.toFixed(1) : "null");
-  $("v-tilt").textContent = tiltDeg;
+  $("v-tilt").textContent = s.tiltDeg == null ? "null" : s.tiltDeg.toFixed(1);
 }
 
-// --- capture: Pointer Events cover pen (iPad), touch, and mouse (desktop dev/mock) ---
-let drawing = false, lastEmit = 0;
+// --- PRIMARY (iPad): Touch events. Touch.force is the reliable Pencil pressure;
+//     PointerEvent.pressure is stuck at a constant on Safria, so we do NOT use it. ---
+function touchSample(t, ts) {
+  const alt = ("altitudeAngle" in t && t.altitudeAngle != null)
+    ? 90 - t.altitudeAngle * 180 / Math.PI   // altitude(rad) -> tilt-from-vertical(deg)
+    : null;
+  return { x: t.clientX, y: t.clientY, t: ts,
+           pressure: "force" in t ? t.force : 0, type: "pen/touch", tiltDeg: alt };
+}
+let lastEmitT = 0;
+canvas.addEventListener("touchstart", e => {
+  e.preventDefault(); probeTouch(e.touches[0]); last = null; emit(touchSample(e.touches[0], e.timeStamp));
+}, { passive: false });
+canvas.addEventListener("touchmove", e => {
+  e.preventDefault();
+  if (e.timeStamp - lastEmitT < RATE_MS) return;   // throttle ~60Hz (Epic 5 caps outbound at 30/s)
+  lastEmitT = e.timeStamp; emit(touchSample(e.touches[0], e.timeStamp));
+}, { passive: false });
+const stopT = () => { last = null; };
+canvas.addEventListener("touchend", stopT);
+canvas.addEventListener("touchcancel", stopT);
+
+// --- MOCK (desktop only): mouse via Pointer Events, so the page is testable with no iPad. ---
+let drawingM = false, lastEmitM = 0;
 canvas.addEventListener("pointerdown", e => {
-  probePointer(e); drawing = true; last = { x: e.clientX, y: e.clientY, t: e.timeStamp }; report(e);
+  if (e.pointerType !== "mouse") return;   // pen/touch go through the Touch path above
+  drawingM = true; last = null; emit({ x: e.clientX, y: e.clientY, t: e.timeStamp, pressure: 0.5, type: "mouse", tiltDeg: null });
 });
 canvas.addEventListener("pointermove", e => {
-  if (!drawing) return;
-  if (e.timeStamp - lastEmit < RATE_MS) return;   // throttle to ~60Hz (Epic 5 caps at 30/s over the wire)
-  lastEmit = e.timeStamp;
-  // coalesced events keep the drawn line smooth without over-sampling the readout
-  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
-  for (const ce of evs) report(ce);
+  if (!drawingM || e.pointerType !== "mouse") return;
+  if (e.timeStamp - lastEmitM < RATE_MS) return;
+  lastEmitM = e.timeStamp; emit({ x: e.clientX, y: e.clientY, t: e.timeStamp, pressure: 0.5, type: "mouse", tiltDeg: null });
 });
-const stop = () => { drawing = false; last = null; };
-canvas.addEventListener("pointerup", stop);
-canvas.addEventListener("pointercancel", stop);
-canvas.addEventListener("pointerleave", stop);
+const stopM = () => { drawingM = false; last = null; };
+canvas.addEventListener("pointerup", stopM);
+canvas.addEventListener("pointerleave", stopM);
 
 $("clear").onclick = () => ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-// --- tilt/altitude availability probe: report what THIS device actually exposes ---
+// --- tilt/force availability probe: report what THIS device actually exposes ---
 function mark(el, present) { el.textContent = present ? "present" : "absent"; el.className = present ? "tilt-yes" : "tilt-no"; }
-let pointerProbed = false;
-function probePointer(e) {
-  if (pointerProbed) return; pointerProbed = true;
-  mark($("p-alt"), "altitudeAngle" in e && e.altitudeAngle != null);
-  mark($("p-tilt"), "tiltX" in e && (e.tiltX !== 0 || e.tiltY !== 0));
-}
-// Touch events historically carried the reliable Apple Pencil tilt on iOS Safari — probe them too.
 let touchProbed = false;
-canvas.addEventListener("touchstart", e => {
-  if (touchProbed) return; touchProbed = true;
-  const t = e.touches[0]; if (!t) return;
+function probeTouch(t) {
+  if (touchProbed || !t) return; touchProbed = true;
+  mark($("p-alt"), "altitudeAngle" in t && t.altitudeAngle != null);   // PointerEvent row reused for Touch.altitude
+  mark($("p-tilt"), "azimuthAngle" in t && t.azimuthAngle != null);
   mark($("p-talt"), "altitudeAngle" in t && t.altitudeAngle != null);
-  mark($("p-tforce"), "force" in t && t.force > 0);
-}, { passive: true });
+  mark($("p-tforce"), "force" in t);
+}
 </script>
 </body>
 </html>
