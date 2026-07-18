@@ -38,9 +38,20 @@ some WebKit APIs behave better over HTTP).
 
 ## Visualization
 
-Full-screen canvas: each stroke's **thickness and color track pressure** (harder
-= thicker + brighter). A live HUD on the right shows pointerType, pressure, x, y,
-smoothed velocity, and tilt updating in real time. "Clear canvas" button resets.
+Full-screen canvas: each stroke's **thickness and color track tilt** (pen tilted
+flatter = thicker + brighter), with **velocity** as the fallback expressive input
+when tilt is absent (e.g. the desktop mouse mock). Tilt drives the visual instead
+of pressure because pressure is hardware-dead on the USB-C Pencil (see finding
+below). A live HUD shows pointerType, pressure, x, y, smoothed velocity, and tilt
+in real time. "Clear canvas" button resets.
+
+> **Flag for Epic 5 / audio-engine (Person B):** pressure was the intended
+> melody/timbre control, but it is unavailable on this hardware. The live
+> expressive axes on this iPad are **tilt** and **velocity**. Someone needs to
+> decide which drives melody/timbre in the audio mapping. `pressure` will still
+> be sent over the wire per the frozen contract, but it will be a constant —
+> audio-engine should not map it. This does not change the contract; it's a
+> mapping decision.
 
 ## Tilt / altitude availability finding
 
@@ -55,14 +66,18 @@ first pen/touch contact —
 - `Touch.altitudeAngle`
 - `Touch.force`
 
-**Record the on-device result here after the first real Pencil test:**
+**On-device result (10th-gen iPad, Apple Pencil USB-C, tested):**
 
-> _(fill in from the iPad — e.g. "10th-gen iPad, Safari 17.x: Touch.force
-> present; Touch.altitudeAngle absent; PointerEvent.altitudeAngle present but
-> always 0 → tilt effectively NOT usable." State it plainly whichever way it
-> goes.)_
+- **Tilt: AVAILABLE.** `Touch.altitudeAngle` / `Touch.azimuthAngle` are present and
+  change live as the Pencil is tilted. Tilt is a usable expressive axis.
+- **Pressure: NOT available — hardware limitation.** `Touch.force` (and the
+  `PointerEvent.pressure` derived from it) is frozen at a constant `~0.240`
+  regardless of how hard you press. Root cause: the **Apple Pencil (USB-C) has no
+  force sensor** — it is the one Apple Pencil without pressure sensitivity, so the
+  signal does not exist at the hardware level. No code change can recover it. A
+  1st- or 2nd-gen Apple Pencil would be required for real pressure.
 
-Desktop reference (Chromium, for sanity only — **not** the device answer):
+Desktop reference (Chromium, sanity only — **not** the device answer):
 `PointerEvent.altitudeAngle` present, `tiltX/Y` zero.
 
 ## Key decisions
@@ -81,20 +96,24 @@ file.
 
 ## Known limitations
 
+- **Pressure is dead on this hardware** (USB-C Pencil, no force sensor). The
+  "press harder changes output" behavior is not achievable here; tilt/velocity
+  are the substitutes. A pressure-capable Pencil (1st/2nd gen) would restore it
+  with no code change.
 - Raw velocity is noisy; HUD smooths it, raw is not. A later epic should decide
   the real smoothing for audio mapping.
-- Mouse pressure is not real pressure — desktop is for pipeline testing only; the
-  pressure DoD ("press harder changes output") can only be confirmed with the
-  Pencil on the iPad.
-- Tilt finding above is pending the first on-device run.
 
 ## Status
 
-Capture pipeline built and verified on desktop (events → extraction → velocity →
-visualization all working). **Not yet tagged `epic-4-complete`** — the DoD
-requires the on-iPad pressure and tilt confirmations above. Tag after the device
-test:
+Capture pipeline built and verified on the target iPad: events → extraction →
+velocity → tilt → visualization all working. Tilt confirmed live; pressure
+confirmed hardware-unavailable and documented. The original DoD's pressure check
+is superseded by the hardware finding above; the visualization proves live
+expressive response via tilt instead.
 
 ```
 git tag -a epic-4-complete -m "pencil capture local"
 ```
+
+(Tag once the team accepts the tilt/velocity substitution for the dead pressure
+axis — see the flag under Visualization.)

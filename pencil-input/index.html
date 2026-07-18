@@ -24,12 +24,12 @@
 <div id="wrap">
   <div id="stage">
     <canvas id="c"></canvas>
-    <div id="hint">Draw with the Apple Pencil. Line thickness follows pressure.</div>
+    <div id="hint">Draw with the Apple Pencil. Line thickness follows tilt (USB-C Pencil has no pressure).</div>
   </div>
   <div id="hud">
     <h1>Pencil Capture</h1>
     <div class="row"><span>pointerType</span><span id="v-type">–</span></div>
-    <div class="row"><span>pressure</span><span id="v-pressure">–</span></div>
+    <div class="row"><span>pressure (const, no HW)</span><span id="v-pressure">–</span></div>
     <div class="row"><span>x</span><span id="v-x">–</span></div>
     <div class="row"><span>y</span><span id="v-y">–</span></div>
     <div class="row"><span>velocity px/s</span><span id="v-vel">–</span></div>
@@ -79,7 +79,10 @@ function emit(s) {   // s = { x, y, t, pressure, type, tiltDeg|null }
   let vel = 0;
   if (last) vel = velocity(last.x, last.y, last.t, s.x, s.y, s.t);
   velEMA = velEMA * 0.8 + vel * 0.2;
-  draw(s.x, s.y, s.pressure);
+  // Pressure is dead on the USB-C Pencil (no force sensor), so drive the visual off
+  // tilt when available, else velocity — both are live signals on this hardware.
+  const expr = s.tiltDeg != null ? Math.min(1, s.tiltDeg / 90) : Math.min(1, velEMA / 1500);
+  draw(s.x, s.y, expr);
   last = { x: s.x, y: s.y, t: s.t };
   $("v-type").textContent = s.type;
   $("v-pressure").textContent = s.pressure.toFixed(3);
