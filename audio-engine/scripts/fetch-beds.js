@@ -15,21 +15,20 @@ import { fileURLToPath } from "node:url";
  * assets/<zone>/ (any mp3/wav/ogg) with no code change needed. New zone
  * folders are auto-discovered too (see playback.js's listZones()).
  *
- * Zones are moods (calm/anxious-relief, happy/upbeat, hype/gym, ...), not
- * just heart-rate tiers — see assets/README.md for the current zone list,
- * including "chill" which has no seed track yet (deliberately left empty
- * for hand-picked sourcing). Mapping a live bpm/mood signal to a zone is
- * Epic 3's call, not decided here — this epic only prepares the assets and
- * a way to switch between them. This script only seeds three of them; all
- * are CC0 (public domain dedication, no attribution legally required,
- * credited below as good practice):
+ * Zones are moods (calm/anxious-relief, dreamy/upbeat, energised/gym, ...),
+ * not just heart-rate tiers — see assets/README.md for the current zone
+ * list. Mapping a live bpm/mood signal to a zone is Epic 3's call, not
+ * decided here — this epic only prepares the assets and a way to switch
+ * between them. This script only seeds three of them (the fourth, `focused`,
+ * was filled in by hand); all are CC0 (public domain dedication, no
+ * attribution legally required, credited below as good practice):
  *
- * - calm:  "Ambient Loop" by YellowTree
- *          https://freesound.org/people/YellowTree/sounds/438901/
- * - happy: "Upbeat124.wav" by BaDoink
- *          https://freesound.org/people/BaDoink/sounds/573986/
- * - hype:  "Race song loop" by neko_4444
- *          https://freesound.org/people/neko_4444/sounds/739064/
+ * - calm:      "Ambient Loop" by YellowTree
+ *              https://freesound.org/people/YellowTree/sounds/438901/
+ * - dreamy:    "Upbeat124.wav" by BaDoink
+ *              https://freesound.org/people/BaDoink/sounds/573986/
+ * - energised: "Race song loop" by neko_4444
+ *              https://freesound.org/people/neko_4444/sounds/739064/
  *
  * See docs/epic-2-audio-engine-scaffold.md for the full decision history
  * (fal.ai -> single CC0 bed -> three zones -> per-zone track pools -> mood taxonomy).
@@ -45,12 +44,12 @@ const SEED_TRACKS = [
     url: "https://cdn.freesound.org/previews/438/438901_1954411-hq.mp3",
   },
   {
-    zone: "happy",
+    zone: "dreamy",
     fileName: "upbeat124-badoink.mp3",
     url: "https://cdn.freesound.org/previews/573/573986_2019171-hq.mp3",
   },
   {
-    zone: "hype",
+    zone: "energised",
     fileName: "race-song-loop-neko4444.mp3",
     url: "https://cdn.freesound.org/previews/739/739064_16072460-hq.mp3",
   },

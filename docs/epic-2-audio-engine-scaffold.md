@@ -19,25 +19,28 @@ audio-engine/
   scripts/
     fetch-beds.js — one-time download of the seed tracks, NOT run by the live server
   assets/
-    calm/ambient-loop-yellowtree.mp3   — committed seed track, calming/anxious-relief zone
-    chill/                             — empty, awaiting hand-sourced tracks (relaxed/feel-good)
-    happy/upbeat124-badoink.mp3        — committed seed track, upbeat/joyful zone
-    hype/race-song-loop-neko4444.mp3   — committed seed track, gym/high-energy zone
+    calm/       — 6 tracks, calming/anxious-relief zone
+    focused/    — 3 tracks, relaxed/feel-good zone (originally named "chill")
+    dreamy/     — 3 tracks, upbeat/joyful zone (originally named "happy")
+    energised/  — 4 tracks, gym/high-energy zone (originally named "hype")
 ```
 
 Zones are **not hardcoded** — they're whatever subdirectories exist under
 `assets/`. Drop more tracks into an existing zone's folder (any `.mp3`/`.wav`/
 `.ogg`) and they join that zone's random pool with no code change; add a new
-zone folder (e.g. `assets/focus/`) and it becomes selectable automatically.
-This was a deliberate design response to two follow-up asks: first "three (or
-four)" zones with tracks to be added later by hand, then a broader ask for a
-richer mood taxonomy (calming/anxious-relief, chill/feel-good, hype/gym,
-happy/upbeat, "etc.") sourced by hand rather than by more fal.ai/Freesound
-digging — the zone count, names, and pool sizes aren't baked into the code
-anywhere. A zone can also have **zero** tracks (like `chill/` right now) —
-the engine logs a warning and just skips it as unselectable until it's
-filled, rather than failing startup, since zones get added ahead of their
-tracks being sourced.
+zone folder (e.g. `assets/epic/`) and it becomes selectable automatically.
+This was a deliberate design response to a sequence of follow-up asks: first
+"three (or four)" zones with tracks to be added later by hand, then a
+broader ask for a richer mood taxonomy sourced by hand rather than by more
+fal.ai/Freesound digging, then a rename pass (`chill`→`focused`,
+`happy`→`dreamy`, `hype`→`energised`, `calm` unchanged) once real tracks were
+in place and the final naming could be judged against actual content — the
+zone count, names, and pool sizes aren't baked into the code anywhere. A zone
+can also have **zero** tracks — the engine logs a warning and just skips it
+as unselectable until it's filled, rather than failing startup, since zones
+get added ahead of their tracks being sourced (this happened for real with
+`focused/`, originally committed empty as `chill/` before tracks were
+sourced for it).
 
 - **Server** (`src/server.js`): a `ws` `WebSocketServer` listening on
   `0.0.0.0:8765` per `contracts/README.md`. On `connection`, it attaches a
@@ -49,7 +52,7 @@ tracks being sourced.
   subdirectories; `switchBed(zone)` lists that zone's audio files, picks one
   at random, decodes it (cached by file path so repeat picks don't re-decode),
   stops whatever's currently looping, and starts the new track looping.
-  Starts on `calm` if present, otherwise the first zone alphabetically.
+  Starts on `calm` if present, otherwise the first playable zone alphabetically.
   Returns `{ context, switchBed }`. **Epic 3 hook point:** map incoming
   `{type: "biometric", bpm}` to a zone name (from `listZones()`) — thresholds
   are Epic 3's call, not decided here — and call `switchBed(zone)` from the WS
@@ -82,37 +85,44 @@ we explicitly avoided ripping/downloading copyrighted streaming-service audio
 (e.g. Spotify) for licensing reasons, and confirmed each track below carries a
 license that permits this use.
 
-All three tracks are from **Freesound.org**, licensed **CC0 1.0** (public
-domain dedication — no attribution legally required; credited here anyway as
-good practice). Verified by fetching each sound's page directly and checking
-the license field, not assumed:
+The three seed tracks are from **Freesound.org**, licensed **CC0 1.0**
+(public domain dedication — no attribution legally required; credited here
+anyway as good practice). Verified by fetching each sound's page directly and
+checking the license field, not assumed:
 
 | Zone | Track | Artist | Duration | Source |
 |---|---|---|---|---|
 | calm | "Ambient Loop" | YellowTree | 35.2s | [freesound.org/.../438901](https://freesound.org/people/YellowTree/sounds/438901/) |
-| happy | "Upbeat124.wav" | BaDoink | 46.5s | [freesound.org/.../573986](https://freesound.org/people/BaDoink/sounds/573986/) |
-| hype | "Race song loop" | neko_4444 | 27.4s | [freesound.org/.../739064](https://freesound.org/people/neko_4444/sounds/739064/) |
-
-`chill` currently has no seed track — left empty deliberately, see the mood
-taxonomy decision below.
+| dreamy | "Upbeat124.wav" | BaDoink | 46.5s | [freesound.org/.../573986](https://freesound.org/people/BaDoink/sounds/573986/) |
+| energised | "Race song loop" | neko_4444 | 27.4s | [freesound.org/.../739064](https://freesound.org/people/neko_4444/sounds/739064/) |
 
 Downloaded as Freesound's "hq" preview (128kbps MP3, 44.1kHz stereo) — full
 originals require a Freesound account/OAuth to download; the preview quality
 is sufficient for a demo bed and avoids adding an auth dependency to the
 fetch script.
 
+All four zones were later filled out with 13 more hand-sourced CC0 tracks
+(see `assets/README.md` for the full attribution table) — every one checked
+individually against its Freesound page before being added, same process as
+the seed tracks above, not assumed from the filename.
+
 **Multiple zones, a pool per zone, and a mood taxonomy rather than pure
 heart-rate tiers.** Follow-up product decisions, in order: (1) instead of a
 single bed with continuous DSP modulation, use distinct tracks selected by
 zone; (2) each zone should hold multiple candidate tracks, randomly picked,
 since more tracks were going to be sourced by hand afterward; (3) the zones
-themselves should be moods, not just an intensity ladder — calm (calming an
-anxious/resting state), chill (relaxed, feel-good), happy (upbeat, joyful),
-hype (gym/high-energy), with room for more (e.g. `focus`, `epic`) since new
-zone folders are auto-discovered. `chill` was created empty on purpose — no
-suitable CC0 track was sourced for it yet; per decision (2)/(3), tracks for
-it (and any future zone) get added by hand directly into `assets/<zone>/`,
-not through another automated search/fetch pass.
+themselves should be moods, not just an intensity ladder — originally named
+calm (calming an anxious/resting state), chill (relaxed, feel-good), happy
+(upbeat, joyful), hype (gym/high-energy); (4) renamed to their current,
+final names — `calm` (unchanged), `focused` (was `chill`), `dreamy` (was
+`happy`), `energised` (was `hype`) — once real tracks existed in each folder
+and the labels could be picked to fit the actual content rather than a
+placeholder mood word. There's room for more zones (e.g. `epic`) since new
+zone folders are auto-discovered. `focused` (then still named `chill`) was
+created empty on purpose at first — no suitable CC0 track was sourced for it
+yet; per decision (2)/(3), tracks for it (and any future zone) get added by
+hand directly into `assets/<zone>/`, not through another automated
+search/fetch pass — and it has since been filled in.
 
 This epic prepares the assets, the directory layout, and the `switchBed`
 mechanism only — deliberately **not** wiring zone selection to live bpm (or
@@ -121,9 +131,9 @@ job (biometric → tempo mapping) and the roadmap gates Epic 3 behind Epic 1 (a
 real, tested BPM source) being done. Building that selection logic against
 fake/mocked bpm now would risk tuning thresholds/mappings against data that
 doesn't resemble what Epic 1's actual detector produces — and moods like
-"happy" vs. "chill" don't obviously sit on a single bpm axis the way
-calm→hype does, so how a live signal picks among more than three mood zones
-is itself an open design question left to Epic 3, not decided here.
+"dreamy" vs. "focused" don't obviously sit on a single bpm axis the way
+calm→energised does, so how a live signal picks among more than three mood
+zones is itself an open design question left to Epic 3, not decided here.
 
 **Runtime: Node.js, plain Web Audio API via `node-web-audio-api` — not
 Tone.js.** Tone.js was tried first (per the roadmap's original phrasing), but
@@ -166,13 +176,17 @@ payloads) — both logged correctly, connect/disconnect logged too.
   Freesound, confirmed valid MP3 (128kbps, 44.1kHz, stereo) via `file`.
 - A standalone decode test confirmed `node-web-audio-api`'s
   `decodeAudioData` handles MP3 (not just WAV) without issue.
-- `npm start` (`node src/index.js`) with `chill/` empty — logs
-  `[index] zone(s) with no tracks yet (not selectable until filled): chill`
-  (non-fatal), then server logs "listening on ws://0.0.0.0:8765", playback
-  logs `zone "calm": looping ambient-loop-yellowtree.mp3 (35.2s, picked from
-  1 track(s))`, process runs without crashing (confirms `node-web-audio-api`
-  found a real audio sink and is producing output rather than throwing
-  `DeviceNotAvailable`).
+- `npm start` (`node src/index.js`) with `chill/` (now `focused/`) empty —
+  logged `[index] zone(s) with no tracks yet (not selectable until filled):
+  chill` (non-fatal), then server logged "listening on ws://0.0.0.0:8765",
+  playback logged `zone "calm": looping ambient-loop-yellowtree.mp3 (35.2s,
+  picked from 1 track(s))`, process ran without crashing (confirms
+  `node-web-audio-api` found a real audio sink and is producing output
+  rather than throwing `DeviceNotAvailable`).
+- After the rename and hand-sourced tracks landed: re-ran a decode check
+  across all 4 zones / 16 tracks (`listZones()` + `listTracks()` +
+  `decodeAudioData` on each file) — all decoded cleanly, no zone empty
+  anymore.
 - Random-pick logic specifically verified: temporarily duplicated a track into
   `assets/calm/` (2 files), called `switchBed("calm")` five times in a row,
   confirmed the log showed both filenames appearing across calls (not stuck
@@ -198,16 +212,22 @@ payloads) — both logged correctly, connect/disconnect logged too.
   still squarely "Web Audio", and the roadmap itself left the runtime choice
   to this epic's judgment.
 - Multiple mood zones instead of one, each holding a pool of tracks rather
-  than a single fixed file, and named for mood (calm/chill/happy/hype) rather
-  than pure heart-rate tiers — a product decision anticipating Epic 3's
-  biometric-driven design and a desire for variety and emotional range, but
-  this epic stops at asset prep + the `switchBed`/random-pick mechanism, not
-  live switching logic (see above).
-- `chill/` is committed empty (a `.gitkeep` placeholder, no tracks) —
-  intentional, awaiting hand-picked sourcing rather than another automated
-  fetch. `index.js`/`playback.js` were both updated to tolerate this (warn,
-  don't fail) since zone folders are now expected to sometimes outpace their
-  track sourcing.
+  than a single fixed file, and named for mood (calm/focused/dreamy/energised)
+  rather than pure heart-rate tiers — a product decision anticipating Epic
+  3's biometric-driven design and a desire for variety and emotional range,
+  but this epic stops at asset prep + the `switchBed`/random-pick mechanism,
+  not live switching logic (see above).
+- Zone folders were renamed once, after they had real content: `chill` →
+  `focused`, `happy` → `dreamy`, `hype` → `energised` (`calm` unchanged).
+  Straight positional rename (kept each folder's already-sourced tracks in
+  place, just relabeled the folder), not a re-sort by content — done via
+  `git mv` so history/blame follows the files.
+- `focused/` (then still named `chill/`) was committed empty at one point (a
+  `.gitkeep` placeholder, no tracks) — intentional, awaiting hand-picked
+  sourcing rather than another automated fetch. `index.js`/`playback.js`
+  were both updated to tolerate this (warn, don't fail) since zone folders
+  are expected to sometimes outpace their track sourcing. It's since been
+  filled in along with the rename.
 
 ## Known limitations
 
