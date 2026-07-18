@@ -383,3 +383,7 @@ export function createStressStateMachine() {
 export function applyMoodInversion(clampedBPM) {
   return INPUT_MAX_BPM + INPUT_MIN_BPM - clampedBPM;
 }
+
+// Note: MAX_BPM_PER_SEC alias kept for backward compatibility.
+// The canonical constant is MAX_BPM_CHANGE_PER_SEC above.
+export const MAX_BPM_PER_SEC = MAX_BPM_CHANGE_PER_SEC;

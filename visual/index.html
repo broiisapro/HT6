@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Human MIDI — Live Visual</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #hud {
+    position: fixed; top: 0; left: 0; right: 0;
+    display: flex; justify-content: space-between; align-items: flex-start;
+    padding: 18px 24px;
+    pointer-events: none;
+    font-family: -apple-system, system-ui, 'SF Pro Display', sans-serif;
+  }
+
+  #bpm-display {
+    font-size: 72px; font-weight: 100; letter-spacing: -2px;
+    color: rgba(255,255,255,0.85);
+    text-shadow: 0 0 40px currentColor;
+    line-height: 1;
+  }
+  #bpm-unit { font-size: 18px; color: rgba(255,255,255,0.4); margin-top: 4px; letter-spacing: 3px; }
+  #mood-badge {
+    font-size: 15px; letter-spacing: 6px; font-weight: 300;
+    color: rgba(255,255,255,0.5);
+    text-transform: uppercase;
+    margin-top: 8px;
+  }
+
+  #status-panel { text-align: right; }
+  #ws-status {
+    font-size: 12px; letter-spacing: 3px;
+    padding: 5px 12px; border-radius: 20px;
+    font-weight: 400;
+    display: inline-block;
+  }
+  #ws-status.idle       { color: #556; border: 1px solid #334; }
+  #ws-status.connecting { color: #aa8; border: 1px solid #665; }
+  #ws-status.connected  { color: #6f6; border: 1px solid #3a3; text-shadow: 0 0 8px #4f4; }
+  #ws-status.error      { color: #f66; border: 1px solid #a33; }
+
+  #connect-form {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    display: flex; gap: 8px; justify-content: center; align-items: center;
+    padding: 14px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.7));
+    pointer-events: all;
+  }
+  #ws-url {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: #ccc; font-size: 13px; padding: 7px 14px;
+    border-radius: 6px; width: 280px; outline: none;
+    font-family: monospace;
+  }
+  button {
+    padding: 7px 16px; border-radius: 6px; font-size: 12px; letter-spacing: 1px;
+    cursor: pointer; border: 1px solid rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.08); color: #ccc;
+  }
+  button:hover { background: rgba(255,255,255,0.15); }
+  #title-text {
+    position: fixed; bottom: 54px; width: 100%; text-align: center;
+    font-size: 11px; letter-spacing: 5px; color: rgba(255,255,255,0.15);
+    text-transform: uppercase; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+
+<div id="hud">
+  <div>
+    <div id="bpm-display">—</div>
+    <div id="bpm-unit">BPM</div>
+    <div id="mood-badge">–</div>
+  </div>
+  <div id="status-panel">
+    <div id="ws-status" class="idle">DISCONNECTED</div>
+  </div>
+</div>
+
+<div id="title-text">HUMAN MIDI · LIVE</div>
+
+<div id="connect-form">
+  <input id="ws-url" type="text" placeholder="ws://192.168.x.x:8765" spellcheck="false">
+  <button id="btn-connect">Connect</button>
+  <button id="btn-disconnect">Disconnect</button>
+</div>
+
+<script>
+// ════════════════════════════════════════════════════════
+// Canvas setup
+// ════════════════════════════════════════════════════════
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+let W, H, cx, cy;
+
+function resize() {
+  W = canvas.width  = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  cx = W / 2; cy = H / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ════════════════════════════════════════════════════════
+// State
+// ════════════════════════════════════════════════════════
+
+// Mood classification mirrors Epic 9 thresholds (same boundaries, raw BPM used here).
+const CALM_ENERGETIC_BPM = 80;
+const ENERGETIC_TENSE_BPM = 96;
+
+// Mood colour targets (hue in HSL)
+const MOOD_HUE = { calm: 215, energetic: 145, tense: 0 };
+// Target background glow colour per mood
+const MOOD_BG  = {
+  calm:      'rgba(10, 20, 60, 1)',
+  energetic: 'rgba(5, 35, 20, 1)',
+  tense:     'rgba(40, 8, 8, 1)',
+};
+
+let currentBpm      = 72;       // last received BPM
+let inferredMood    = 'energetic';
+let moodHue         = MOOD_HUE.energetic;
+let targetHue       = moodHue;
+let bgColor         = MOOD_BG.energetic;
+let targetBgColor   = bgColor;
+
+// Heartbeat pulse rings
+const pulses = [];   // {r, alpha}
+let nextBeatTs = 0;  // when to fire the next auto-beat from BPM
+
+// Pencil trails
+const trails = [];   // {x,y,r,alpha,hue,brightness}
+
+// EMA smooth the BPM for visuals only (raw is choppy)
+let smoothBpm = 72;
+const BPM_EMA = 0.15;
+
+// ════════════════════════════════════════════════════════
+// Mood inference from raw BPM (mirrors Epic 9 thresholds)
+// ════════════════════════════════════════════════════════
+function inferMood(bpm) {
+  if (bpm < CALM_ENERGETIC_BPM)   return 'calm';
+  if (bpm >= ENERGETIC_TENSE_BPM) return 'tense';
+  return 'energetic';
+}
+
+function updateMood(bpm) {
+  const newMood = inferMood(bpm);
+  if (newMood !== inferredMood) {
+    inferredMood   = newMood;
+    targetHue      = MOOD_HUE[newMood];
+    targetBgColor  = MOOD_BG[newMood];
+    document.getElementById('mood-badge').textContent = newMood.toUpperCase();
+  }
+}
+
+// ════════════════════════════════════════════════════════
+// Heartbeat
+// ════════════════════════════════════════════════════════
+function triggerBeat() {
+  pulses.push({ r: 0, alpha: 1.0 });
+}
+
+// ════════════════════════════════════════════════════════
+// Pencil trail
+// ════════════════════════════════════════════════════════
+function addTrail(msg) {
+  // Map canvas pencil coordinates → screen.
+  // The visual canvas runs full screen; pencil canvas is iPad (1180×816 ish).
+  // Simple normalise to [0,1] then map to screen.
+  const PENCIL_W = 1180, PENCIL_H = 816;
+  const sx = (msg.x / PENCIL_W) * W;
+  const sy = (msg.y / PENCIL_H) * H;
+
+  // Tilt drives hue (vertical = cool blue, flat = warm amber)
+  const tilt = msg.tilt;
+  const hue  = tilt != null
+    ? Math.round(200 - tilt * 2)   // 0°=200 (cyan), 90°=20 (orange)
+    : moodHue;
+
+  const velocity = msg.velocity ?? 0;
+  const brightness = Math.min(95, 50 + velocity / 25);
+  const radius = Math.min(16, 4 + velocity / 120);
+
+  trails.push({ x: sx, y: sy, r: radius, alpha: 1.0, hue, brightness });
+}
+
+// ════════════════════════════════════════════════════════
+// Render loop
+// ════════════════════════════════════════════════════════
+let lastFrame = 0;
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const dtMs = ts - lastFrame;
+  lastFrame = ts;
+
+  // ── Slow fade to clear (creates trail persistence) ─────────────────────
+  ctx.fillStyle = 'rgba(0,0,0,0.045)';
+  ctx.fillRect(0, 0, W, H);
+
+  // ── Schedule heartbeat from BPM ─────────────────────────────────────────
+  if (ts >= nextBeatTs) {
+    triggerBeat();
+    const beatMs  = (60000 / Math.max(30, smoothBpm));
+    nextBeatTs    = ts + beatMs;
+  }
+
+  // ── Smooth mood hue ─────────────────────────────────────────────────────
+  moodHue += (targetHue - moodHue) * 0.02;
+
+  // ── Ambient background pulse from mood ──────────────────────────────────
+  const bgAlpha = 0.18 + 0.06 * Math.sin(ts * 0.0008);
+  const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, Math.min(W, H) * 0.7);
+  grad.addColorStop(0, `hsla(${moodHue}, 55%, 20%, ${bgAlpha})`);
+  grad.addColorStop(1, 'hsla(0,0%,0%,0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // ── Pulse rings ─────────────────────────────────────────────────────────
+  const maxPulseR = Math.min(W, H) * 0.42;
+  for (let i = pulses.length - 1; i >= 0; i--) {
+    const p = pulses[i];
+    p.r     += 2.8;
+    p.alpha -= 0.016;
+    if (p.alpha <= 0) { pulses.splice(i, 1); continue; }
+
+    ctx.strokeStyle = `hsla(${moodHue}, 70%, 65%, ${p.alpha * 0.9})`;
+    ctx.lineWidth = 2 + p.alpha * 3;
+    ctx.shadowBlur  = 20 * p.alpha;
+    ctx.shadowColor = `hsl(${moodHue}, 80%, 60%)`;
+    ctx.beginPath();
+    ctx.arc(cx, cy, p.r * (maxPulseR / 80), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  // ── Core glow circle ────────────────────────────────────────────────────
+  const coreR = 28 + 8 * Math.sin(ts * 0.0015);
+  const coreGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, coreR * 3);
+  coreGrad.addColorStop(0,   `hsla(${moodHue}, 80%, 80%, 0.9)`);
+  coreGrad.addColorStop(0.3, `hsla(${moodHue}, 70%, 55%, 0.5)`);
+  coreGrad.addColorStop(1,   `hsla(${moodHue}, 60%, 30%, 0)`);
+  ctx.fillStyle = coreGrad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, coreR * 3, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── Pencil trails ────────────────────────────────────────────────────────
+  for (let i = trails.length - 1; i >= 0; i--) {
+    const t = trails[i];
+    t.alpha -= 0.012;
+    if (t.alpha <= 0) { trails.splice(i, 1); continue; }
+
+    ctx.shadowBlur  = 12 * t.alpha;
+    ctx.shadowColor = `hsl(${t.hue}, 90%, ${t.brightness}%)`;
+    ctx.fillStyle   = `hsla(${t.hue}, 90%, ${t.brightness}%, ${t.alpha})`;
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, t.r * t.alpha, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.shadowBlur = 0;
+}
+
+requestAnimationFrame(frame);
+
+// ════════════════════════════════════════════════════════
+// WebSocket client
+// ════════════════════════════════════════════════════════
+let ws = null;
+
+function wsSetStatus(text, cls) {
+  const el = document.getElementById('ws-status');
+  el.textContent = text;
+  el.className   = cls;
+}
+
+function wsConnect(url) {
+  if (!url) { wsSetStatus('NO URL', 'error'); return; }
+  if (ws) { ws.onopen = ws.onerror = ws.onclose = ws.onmessage = null; ws.close(); ws = null; }
+  wsSetStatus('CONNECTING', 'connecting');
+  try { ws = new WebSocket(url); } catch { wsSetStatus('BAD URL', 'error'); return; }
+
+  ws.onopen = () => wsSetStatus('CONNECTED', 'connected');
+  ws.onerror = () => wsSetStatus('ERROR', 'error');
+  ws.onclose = () => wsSetStatus('CLOSED', 'error');
+
+  ws.onmessage = (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+
+    if (msg.type === 'biometric' && typeof msg.bpm === 'number') {
+      // Smooth for display
+      smoothBpm = smoothBpm * (1 - BPM_EMA) + msg.bpm * BPM_EMA;
+      currentBpm = msg.bpm;
+      document.getElementById('bpm-display').textContent = Math.round(smoothBpm);
+      updateMood(smoothBpm);
+    }
+
+    if (msg.type === 'pencil') {
+      addTrail(msg);
+    }
+  };
+}
+
+function wsDisconnect() {
+  if (ws) { ws.onopen = ws.onerror = ws.onclose = ws.onmessage = null; ws.close(); ws = null; }
+  wsSetStatus('DISCONNECTED', 'idle');
+}
+
+document.getElementById('btn-connect').onclick    = () => wsConnect(document.getElementById('ws-url').value.trim());
+document.getElementById('btn-disconnect').onclick = wsDisconnect;
+document.getElementById('ws-url').addEventListener('keydown', e => {
+  if (e.key === 'Enter') wsConnect(e.target.value.trim());
+});
+</script>
+</body>
+</html>
