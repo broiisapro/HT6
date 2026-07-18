@@ -42,7 +42,7 @@ const MIME_TYPES = {
 
 /**
  * Epic 9: minimal static file server for the mode-selector UI
- * (`audio-engine/public/`, built from `audio-engine/ui/` via
+ * (`audio-engine/public/`, built from the sibling `ui/` sub-package via
  * `npm run build:ui`). Attached to the *same* HTTP server the WebSocket
  * server upgrades from — one port (8765) for everything, so a performer on
  * the LAN only needs one address (`http://<mac-ip>:8765` for the UI,

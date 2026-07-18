@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node src/index.js",
     "fetch-beds": "node scripts/fetch-beds.js",
-    "build:ui": "npm --prefix ui install && npm --prefix ui run build"
+    "build:ui": "npm --prefix ../ui install && npm --prefix ../ui run build"
   },
   "dependencies": {
     "node-web-audio-api": "^1.0.9",
