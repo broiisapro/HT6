@@ -29,6 +29,65 @@ import {
 const HOST = "0.0.0.0";
 const PORT = 8765;
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(__dirname, "..", "public");
+
+const VALID_ZONES = ZONE_BANDS.map((b) => b.zone);
+const VALID_INTENTIONS = Object.keys(INTENTION_CLASSIFIERS);
+
+const MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+};
+
+/**
+ * Epic 9: minimal static file server for the mode-selector UI
+ * (`audio-engine/public/`, built from the sibling `ui/` sub-package via
+ * `npm run build:ui`). Attached to the *same* HTTP server the WebSocket
+ * server upgrades from — one port (8765) for everything, so a performer on
+ * the LAN only needs one address (`http://<mac-ip>:8765` for the UI,
+ * `ws://<mac-ip>:8765` for the contract socket) rather than remembering two
+ * ports. `ws`'s `WebSocketServer` only intercepts the HTTP `upgrade` event;
+ * plain GET requests fall through to this listener untouched.
+ */
+async function serveStatic(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  let filePath = url.pathname === "/" ? "/index.html" : url.pathname;
+  filePath = path.normalize(filePath).replace(/^(\.\.[/\\])+/, "");
+  const resolved = path.join(PUBLIC_DIR, filePath);
+
+  try {
+    const data = await readFile(resolved);
+    const ext = path.extname(resolved).toLowerCase();
+    res.writeHead(200, { "Content-Type": MIME_TYPES[ext] ?? "application/octet-stream" });
+    res.end(data);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      // SPA fallback: unknown paths (client-side routes, none currently) serve index.html.
+      try {
+        const data = await readFile(path.join(PUBLIC_DIR, "index.html"));
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(data);
+      } catch {
+        res.writeHead(404);
+        res.end("Not found");
+      }
+    } else {
+      res.writeHead(500);
+      res.end("Internal error");
+    }
+  }
+}
+
 /**
  * Contract WebSocket server (see ../../contracts/README.md).
  *

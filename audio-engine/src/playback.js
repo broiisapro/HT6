@@ -1,5 +1,5 @@
 import { AudioContext } from "node-web-audio-api";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_CUTOFF_HZ, DEFAULT_TREMOLO_HZ } from "./pencil-mapper.js";
@@ -22,7 +22,46 @@ const STRESS_DUCK_TC    = 0.04;  // setTargetAtTime TC for duck (150ms dip)
 const STRESS_RECOVER_TC = 0.3;   // setTargetAtTime TC for duck recovery
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const BED_PATH = path.join(__dirname, "..", "assets", "bed.wav");
+const ASSETS_DIR = path.join(__dirname, "..", "assets");
+const AUDIO_EXTENSIONS = new Set([".mp3", ".wav", ".ogg"]);
+const DEFAULT_ZONE = "calm";
+
+/** Crossfade duration (seconds) when switching zones. */
+const CROSSFADE_SEC = 0.6;
+
+/** Tremolo (Epic 6) gain-modulation constants — see playback.js on main for origin. */
+const TREMOLO_BASE_GAIN = 0.85;
+const TREMOLO_DEPTH = 0.15; // gain oscillates in [BASE-DEPTH, BASE+DEPTH] = [0.7, 1.0]
+
+/**
+ * Zones are whatever subdirectories exist under assets/ — not hardcoded.
+ * Drop more tracks into an existing zone's folder (e.g. assets/calm/) and
+ * they join that zone's random pool automatically; add a new zone folder
+ * (e.g. assets/epic/) and it becomes selectable with no code change.
+ */
+export async function listZones() {
+  const entries = await readdir(ASSETS_DIR, { withFileTypes: true });
+  return entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+}
+
+export async function listTracks(zone) {
+  const zoneDir = path.join(ASSETS_DIR, zone);
+  const entries = await readdir(zoneDir, { withFileTypes: true });
+  return entries
+    .filter((e) => e.isFile() && AUDIO_EXTENSIONS.has(path.extname(e.name).toLowerCase()))
+    .map((e) => path.join(zoneDir, e.name));
+}
+
+/** Zones that currently have at least one track — the only ones startable/selectable right now. */
+export async function listPlayableZones() {
+  const zones = await listZones();
+  const results = await Promise.all(zones.map(async (zone) => ((await listTracks(zone)).length > 0 ? zone : null)));
+  return results.filter((zone) => zone !== null);
+}
+
+function pickRandom(list) {
+  return list[Math.floor(Math.random() * list.length)];
+}
 
 // Tremolo (Epic 6) is a periodic gain modulation: an LFO oscillator feeds a
 // depth-scaling gain node into the output gain's AudioParam, which Web Audio
@@ -33,18 +72,31 @@ const TREMOLO_BASE_GAIN = 0.85;
 const TREMOLO_DEPTH = 0.15; // gain oscillates in [BASE-DEPTH, BASE+DEPTH] = [0.7, 1.0]
 
 /**
- * Loads the committed fal.ai bed (audio-engine/assets/bed.wav) and loops it
- * continuously through the system audio output via node-web-audio-api,
- * a native (non-browser) Web Audio API implementation for Node.
+ * Loads mood-zone tracks (audio-engine/assets/<zone>/*) and loops a
+ * randomly-picked track from the current zone through a persistent
+ * filter -> pan -> tremolo effects chain to the system audio output, via
+ * node-web-audio-api (a native, non-browser Web Audio API implementation —
+ * see docs/epic-2-audio-engine-scaffold.md for why Tone.js was dropped).
  *
- * Deviation from the original Tone.js plan: Tone.js was tried first, but its
- * internal type-checks (via the `standardized-audio-context` package) only
- * recognize that package's own AudioParam/AudioNode classes, not
- * node-web-audio-api's native ones — so `new Tone.Player(...)` throws
- * "param must be an AudioParam" even though node-web-audio-api is a
- * spec-compliant implementation. Rather than fight that interop, this uses
- * node-web-audio-api's native nodes directly — plain Web Audio API, no
- * Tone.js layer. See docs/epic-2-audio-engine-scaffold.md for details.
+ * ── Persistent effects chain ────────────────────────────────────────────
+ * filterNode (lowpass, brightness) -> pannerNode (stereo position) ->
+ * tremoloGain (note-density proxy, driven by an LFO) -> destination. These
+ * three nodes are created once and never torn down — Epic 6's
+ * pencil-mapper.js output targets them directly via setMelodyParams(), and
+ * they keep working unchanged across zone switches, since switchBed() only
+ * ever replaces what feeds *into* the front of this chain.
+ *
+ * ── Zone switching + crossfade ──────────────────────────────────────────
+ * Each zone's source gets its own per-source gain node (not shared) so an
+ * outgoing and incoming track can overlap briefly: switchBed() ramps the
+ * new source's gain 0->1 and the old one's 1->0 over CROSSFADE_SEC, then
+ * stops/disconnects the old source once the fade completes. This avoids
+ * the hard stop/start cut of the original single-zone version.
+ *
+ * ── Tempo ────────────────────────────────────────────────────────────────
+ * setTempo(rate) applies playbackRate to whichever source is currently the
+ * active (post-crossfade) one — callers don't need to track node identity
+ * across zone switches.
  *
  * Epic 3/6 hook point: node-web-audio-api's AudioContext already exposes the
  * full native node set (BiquadFilterNode, GainNode, playbackRate on the
@@ -57,15 +109,14 @@ const TREMOLO_DEPTH = 0.15; // gain oscillates in [BASE-DEPTH, BASE+DEPTH] = [0.
  * These are separate AudioParams from Epic 3's `sourceNode.playbackRate`
  * (tempo), so the two epics' live inputs never contend for the same knob.
  */
-export async function startPlayback() {
+export async function startPlayback(initialZone) {
   const context = new AudioContext();
+  const decodedCache = new Map(); // filePath -> AudioBuffer, avoids re-decoding on repeat picks
 
-  const fileBuffer = await readFile(BED_PATH);
-  const arrayBuffer = fileBuffer.buffer.slice(
-    fileBuffer.byteOffset,
-    fileBuffer.byteOffset + fileBuffer.byteLength
-  );
-  const audioBuffer = await context.decodeAudioData(arrayBuffer);
+  // ── Persistent effects chain (survives zone switches) ──────────────────
+  const filterNode = context.createBiquadFilter();
+  filterNode.type = "lowpass";
+  filterNode.frequency.value = DEFAULT_CUTOFF_HZ;
 
   const sourceNode = context.createBufferSource();
   sourceNode.buffer = audioBuffer;
@@ -184,7 +235,8 @@ export async function startPlayback() {
     console.log(`[playback] zone → ${zoneName} (filter=${profile.filterHz}Hz tremolo=${profile.tremoloHz}Hz)`);
   }
 
-  console.log(`[playback] looping ${BED_PATH} (${audioBuffer.duration.toFixed(1)}s bed)`);
+  const tremoloGain = context.createGain();
+  tremoloGain.gain.value = TREMOLO_BASE_GAIN;
 
   /**
    * Fire one low-sine thump for a detected heartbeat.
@@ -262,3 +314,5 @@ export async function startPlayback() {
 
   return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity, playPluck, switchBed };
 }
+
+export { DEFAULT_ZONE };
