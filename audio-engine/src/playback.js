@@ -128,20 +128,45 @@ export async function startPlayback(initialZone) {
   tremoloGain.connect(context.destination);
   lfo.start();
 
-  // ── Load initial track ───────────────────────────────────────────────
-  const zones = await listZones();
-  const startZone = zones.includes(initialZone) ? initialZone : (zones[0] || DEFAULT_ZONE);
-  const tracks = await listTracks(startZone);
-  const trackPath = pickRandom(tracks);
-  const arrayBuffer = await readFile(trackPath);
-  const audioBuffer = await context.decodeAudioData(arrayBuffer.buffer);
+  // ── Pre-load all zone tracks for instant crossfade on zone switch ────
+  // Decode every track upfront; switchBed() crossfades synchronously without
+  // waiting for file I/O or decoding.
+  const playableZones = await listPlayableZones();
+  const startZone = playableZones.includes(initialZone) ? initialZone : (playableZones[0] || DEFAULT_ZONE);
+  const allZoneBuffers = new Map(); // zoneName → AudioBuffer[]
 
-  const sourceNode = context.createBufferSource();
-  sourceNode.buffer = audioBuffer;
-  sourceNode.loop = true;
-  sourceNode.connect(filterNode);
-  sourceNode.start();
-  console.log(`[playback] loaded and looping "${path.basename(trackPath)}" (${audioBuffer.duration.toFixed(1)}s) in "${startZone}" zone`);
+  for (const zone of playableZones) {
+    const tracks = await listTracks(zone);
+    const buffers = await Promise.all(
+      tracks.map(async (filePath) => {
+        const raw = await readFile(filePath);
+        const buf = await context.decodeAudioData(raw.buffer);
+        decodedCache.set(filePath, buf);
+        return buf;
+      })
+    );
+    allZoneBuffers.set(zone, buffers);
+    console.log(`[playback] pre-loaded ${buffers.length} track(s) for zone "${zone}"`);
+  }
+
+  // ── Start initial track with a per-source gain node ───────────────────
+  // Each source gets its own gain node so outgoing and incoming tracks can
+  // overlap during crossfade. switchBed() ramps these gains 0↔1.
+  let currentRate     = 1.0;
+  let currentZoneName = startZone;
+
+  const initialBufs = allZoneBuffers.get(startZone) ?? [];
+  const initialBuffer = pickRandom(initialBufs);
+
+  let activeSource = context.createBufferSource();
+  activeSource.buffer = initialBuffer;
+  activeSource.loop   = true;
+  let activeSourceGain = context.createGain();
+  activeSourceGain.gain.value = 1.0;
+  activeSource.connect(activeSourceGain);
+  activeSourceGain.connect(filterNode);
+  activeSource.start();
+  console.log(`[playback] starting in zone "${startZone}" (${initialBufs.length} track(s) available)`);
 
   // ── Item 4: Stress layer ──────────────────────────────────────────────────
   // White noise → bandpass filter → gain node driven by intensity01.
@@ -188,34 +213,26 @@ export async function startPlayback(initialZone) {
     }
   }
 
-  // ── Epic 9: zone audio profiles ─────────────────────────────────────────
-  // Each zone has a distinct audio character expressed via filter cutoff and
-  // tremolo rate. switchBed() crossfades between profiles smoothly.
-  //
-  // Profile values chosen for audible differentiation:
-  //   calm      — dark (400 Hz lowpass) + slow tremolo (0.4 Hz) → muted, restful
-  //   focused   — mid-bright (2000 Hz) + moderate tremolo (1.0 Hz) → alert, steady
-  //   dreamy    — bright (4500 Hz) + flowing tremolo (2.5 Hz) → spacious, floating
-  //   energised — very bright (8000 Hz) + fast tremolo (5.0 Hz) → vivid, excited
-  //
-  // Note: pencil-mapper.js also drives filterNode.frequency and lfo.frequency.
-  // Pencil input (arriving at ~30 msg/s) overrides zone values in practice —
-  // the zone profile is the ambient baseline that pencil modulates on top of.
-  // This is acceptable for the hackathon demo scope.
+  // ── Zone audio profiles ──────────────────────────────────────────────────
+  // Extreme values for clearly audible transitions. Pencil overrides these
+  // while active; the profile is the baseline the mix returns to on Pencil lift.
+  //   calm:      very dark + near-static   → muted, restful
+  //   focused:   midrange + steady pulse   → alert, purposeful
+  //   dreamy:    very bright + ultra-slow  → spacious, ethereal
+  //   energised: fully open + rapid tremolo → vivid, intense
   const ZONE_PROFILES = {
-    calm:      { filterHz: 400,  tremoloHz: 0.4 },
-    focused:   { filterHz: 2000, tremoloHz: 1.0 },
-    dreamy:    { filterHz: 4500, tremoloHz: 2.5 },
-    energised: { filterHz: 8000, tremoloHz: 5.0 },
+    calm:      { filterHz: 150,   tremoloHz: 0.1 },
+    focused:   { filterHz: 2500,  tremoloHz: 1.5 },
+    dreamy:    { filterHz: 7000,  tremoloHz: 0.3 },
+    energised: { filterHz: 18000, tremoloHz: 8.0 },
   };
 
   // TC = 0.5s → ~3 TC = 1.5s for a natural crossfade between zone profiles.
   const ZONE_CROSSFADE_TC = 0.5;
 
   /**
-   * Crossfade audio parameters to match the given zone's profile.
-   * Called by server.js on every confirmed zone switch (dynamic mode only).
-   * No-op in static mode — zone is pinned, no profile switch needed.
+   * Switch to a zone: crossfade the track AND apply the zone's DSP profile.
+   * Called by server.js on zone changes in both static and dynamic mode.
    * @param {string} zoneName - One of the four zone names.
    */
   function switchBed(zoneName) {
@@ -225,9 +242,48 @@ export async function startPlayback(initialZone) {
       return;
     }
     const now = context.currentTime;
+
+    // 1. Apply zone DSP profile (filter brightness + tremolo rate).
     filterNode.frequency.setTargetAtTime(profile.filterHz, now, ZONE_CROSSFADE_TC);
     lfo.frequency.setTargetAtTime(profile.tremoloHz, now, ZONE_CROSSFADE_TC);
-    console.log(`[playback] zone → ${zoneName} (filter=${profile.filterHz}Hz tremolo=${profile.tremoloHz}Hz)`);
+    currentZoneName = zoneName;
+
+    // 2. Crossfade to a random track from the new zone's folder.
+    const zoneBufs = allZoneBuffers.get(zoneName);
+    if (!zoneBufs || zoneBufs.length === 0) {
+      console.warn(`[playback] switchBed: no tracks for zone "${zoneName}" — DSP profile applied, track unchanged`);
+      return;
+    }
+    const newBuffer = pickRandom(zoneBufs);
+
+    const newSrc = context.createBufferSource();
+    newSrc.buffer = newBuffer;
+    newSrc.loop   = true;
+    newSrc.playbackRate.value = currentRate; // inherit active tempo nudge
+
+    const newGain = context.createGain();
+    newGain.gain.value = 0; // start silent
+    newSrc.connect(newGain);
+    newGain.connect(filterNode);
+    newSrc.start();
+
+    // Ramp new source in, old source out over CROSSFADE_SEC.
+    const TC = CROSSFADE_SEC / 3; // 3 TCs → ~95% settled
+    newGain.gain.setTargetAtTime(1.0, now, TC);
+    if (activeSourceGain) activeSourceGain.gain.setTargetAtTime(0, now, TC);
+
+    const oldSrc  = activeSource;
+    const oldGain = activeSourceGain;
+    activeSource      = newSrc;
+    activeSourceGain  = newGain;
+
+    // Disconnect old source after crossfade settles (~5 TCs).
+    setTimeout(() => {
+      try { if (oldSrc)  { oldSrc.stop(); oldSrc.disconnect(); }  } catch (_) {}
+      try { if (oldGain) oldGain.disconnect(); } catch (_) {}
+    }, Math.ceil(CROSSFADE_SEC * 5 * 1000));
+
+    console.log(`[playback] zone → ${zoneName} (filter=${profile.filterHz}Hz tremolo=${profile.tremoloHz}Hz) + track crossfade`);
   }
 
   /**
@@ -304,7 +360,23 @@ export async function startPlayback(initialZone) {
     _pluckGain = gain;
   }
 
-  return { context, sourceNode, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity, playPluck, switchBed };
+  /**
+   * Set the playback rate on the currently active source node.
+   * Use this instead of accessing sourceNode.playbackRate directly —
+   * the active source changes on every zone/track switch.
+   * @param {number} rate
+   */
+  function setPlaybackRate(rate) {
+    currentRate = rate;
+    if (activeSource) activeSource.playbackRate.value = rate;
+  }
+
+  /** Return the current zone's DSP profile, or null if zone is unknown. */
+  function getCurrentZoneProfile() {
+    return ZONE_PROFILES[currentZoneName] ?? null;
+  }
+
+  return { setPlaybackRate, getCurrentZoneProfile, filterNode, pannerNode, tremoloGain, lfo, playBeat, applyStressIntensity, playPluck, switchBed };
 }
 
 export { DEFAULT_ZONE };

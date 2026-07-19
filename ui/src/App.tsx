@@ -39,8 +39,7 @@ export default function App() {
   }, []);
 
   function apply(next: Pending) {
-    const sent = sendMode(next.mode, next.zone, next.intention);
-    if (!sent) return;
+    sendMode(next.mode, next.zone, next.intention);
     setPending(next);
     if (pendingTimerRef.current) clearTimeout(pendingTimerRef.current);
     pendingTimerRef.current = setTimeout(() => setPending(null), APPLY_TIMEOUT_MS);
@@ -85,7 +84,7 @@ export default function App() {
 
         <div
           className="flex flex-1 flex-col justify-center gap-4 transition-opacity duration-300"
-          style={{ opacity: disconnected ? 0.45 : 1, pointerEvents: disconnected ? "none" : "auto" }}
+          style={{ opacity: disconnected ? 0.45 : 1 }}
         >
           {effectiveMode === "static" ? (
             <div className="grid grid-cols-2 gap-4">

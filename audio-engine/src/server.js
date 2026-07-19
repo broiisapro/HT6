@@ -139,7 +139,8 @@ async function serveStatic(req, res) {
 const BEAT_DEBOUNCE_MS = 300;
 
 export function startServer({
-  sourceNode = null,
+  setPlaybackRate = null,
+  getCurrentZoneProfile = null,
   filterNode = null,
   pannerNode = null,
   lfo = null,
@@ -260,11 +261,11 @@ export function startServer({
     staleTimer = setTimeout(() => {
       // Epic 8: suppress revert while fallback is replaying biometric data.
       if (fallbackPlayer?.active) return;
-      if (sourceNode) {
+      if (setPlaybackRate) {
         console.log(
           `[tempo] no biometric for ${STALE_TIMEOUT_MS}ms — reverting to default playbackRate=1.0 (96 BPM)`
         );
-        sourceNode.playbackRate.value = 1.0;
+        setPlaybackRate(1.0);
       }
       // Item 4: stale data forces stress machine back to CALM.
       stressMachine.forceCalm();
@@ -283,12 +284,17 @@ export function startServer({
     pencilStaleTimer = setTimeout(() => {
       // Epic 8: suppress revert while fallback is replaying pencil data.
       if (fallbackPlayer?.active) return;
+      // Revert to the current zone's DSP profile so the zone character is
+      // preserved when the performer lifts the Pencil, not global defaults.
+      const zoneProfile = getCurrentZoneProfile?.();
+      const filterHz  = zoneProfile?.filterHz  ?? DEFAULT_CUTOFF_HZ;
+      const tremoloHz = zoneProfile?.tremoloHz ?? DEFAULT_TREMOLO_HZ;
       console.log(
-        `[melody] no pencil for ${PENCIL_STALE_TIMEOUT_MS}ms — reverting to default filter/tremolo/pan`
+        `[melody] no pencil for ${PENCIL_STALE_TIMEOUT_MS}ms — reverting to zone profile (filter=${filterHz}Hz tremolo=${tremoloHz}Hz)`
       );
-      if (filterNode) filterNode.frequency.setTargetAtTime(DEFAULT_CUTOFF_HZ, filterNode.context.currentTime, 0.05);
-      if (lfo) lfo.frequency.setTargetAtTime(DEFAULT_TREMOLO_HZ, lfo.context.currentTime, 0.05);
-      if (pannerNode) pannerNode.pan.setTargetAtTime(DEFAULT_PAN, pannerNode.context.currentTime, 0.05);
+      if (filterNode) filterNode.frequency.setTargetAtTime(filterHz,  filterNode.context.currentTime, 0.05);
+      if (lfo)        lfo.frequency.setTargetAtTime(tremoloHz,         lfo.context.currentTime,        0.05);
+      if (pannerNode) pannerNode.pan.setTargetAtTime(DEFAULT_PAN,      pannerNode.context.currentTime, 0.05);
     }, PENCIL_STALE_TIMEOUT_MS);
   }
 
@@ -389,8 +395,8 @@ export function startServer({
           console.log(`[stress] ${prevState} → ${newState} (intensity=${intensity01.toFixed(3)})`);
         }
 
-        if (sourceNode) {
-          sourceNode.playbackRate.value = rate;
+        if (setPlaybackRate) {
+          setPlaybackRate(rate);
           const applyTime = Date.now();
           const transitLatency = typeof message.timestamp === "number"
             ? rxTime - message.timestamp
@@ -408,7 +414,7 @@ export function startServer({
             ` | msg_ts=${message.timestamp}`
           );
         } else {
-          console.log(`[tempo] biometric received but no sourceNode — heart=${message.bpm} BPM (no-op)`);
+          console.log(`[tempo] biometric received but no setPlaybackRate — heart=${message.bpm} BPM (no-op)`);
         }
       }
 
@@ -435,6 +441,7 @@ export function startServer({
           pinnedZone = zone;
           activeZone = zone;                // update display zone immediately
           zoneTracker.forceZone(zone);      // sync tracker for when we return to dynamic
+          if (switchBed) switchBed(zone);   // apply zone audio profile immediately
           console.log(`[mode] → static  pinnedZone=${pinnedZone}`);
 
         } else if (mode === "dynamic") {
